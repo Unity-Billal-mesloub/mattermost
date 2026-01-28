@@ -1692,9 +1692,9 @@ func (a *App) DeletePost(rctx request.CTX, postID, deleteByID string) (*model.Po
 		return nil, model.NewAppError("DeletePost", "app.post.get.app_error", nil, "", http.StatusBadRequest).Wrap(err)
 	}
 
-	if post.Type == model.PostTypeBurnOnRead {
-		return nil, a.PermanentDeletePost(rctx, postID, deleteByID)
-	}
+	//if post.Type == model.PostTypeBurnOnRead {
+	//	return nil, a.PermanentDeletePost(rctx, postID, deleteByID)
+	//}
 
 	channel, appErr := a.GetChannel(rctx, post.ChannelId)
 	if appErr != nil {
@@ -2190,7 +2190,7 @@ func (a *App) countThreadMentions(rctx request.CTX, user *model.User, post *mode
 		user,
 		map[string]string{},
 		&model.Status{Status: model.StatusOnline}, // Assume the user is online since they would've triggered this
-		true, // Assume channel mentions are always allowed for simplicity
+		true,                                      // Assume channel mentions are always allowed for simplicity
 	)
 
 	posts, nErr := a.Srv().Store().Post().GetPostsByThread(post.Id, timestamp)
@@ -2275,7 +2275,7 @@ func (a *App) countMentionsFromPost(rctx request.CTX, user *model.User, post *mo
 		user,
 		members[user.Id],
 		&model.Status{Status: model.StatusOnline}, // Assume the user is online since they would've triggered this
-		true, // Assume channel mentions are always allowed for simplicity
+		true,                                      // Assume channel mentions are always allowed for simplicity
 	)
 	commentMentions := user.NotifyProps[model.CommentsNotifyProp]
 	checkForCommentMentions := commentMentions == model.CommentsNotifyRoot || commentMentions == model.CommentsNotifyAny
@@ -2950,6 +2950,16 @@ func (a *App) MoveThread(rctx request.CTX, postID string, sourceChannelID, chann
 	return nil
 }
 
+// PermanentDeletePost deletes following items associated with a post-
+// 1. Files
+// 2. Thread
+// 3. Reactions
+// 4. TemporaryPosts
+// 5. ReadReceipts
+// 6. The Post itself
+// 7. Post flag (Saved status)
+// 8. Persistent Notifications
+// 9. Associated drafts
 func (a *App) PermanentDeletePost(rctx request.CTX, postID, deleteByID string) *model.AppError {
 	post, err := a.Srv().Store().Post().GetSingle(sqlstore.RequestContextWithMaster(rctx), postID, true)
 	if err != nil {
@@ -3546,7 +3556,9 @@ func (a *App) BurnPost(rctx request.CTX, post *model.Post, userID string, connec
 
 	// If user is the author, permanently delete the post
 	if post.UserId == userID {
-		return a.PermanentDeletePost(rctx, post.Id, userID)
+		// LOL
+		//return a.PermanentDeletePost(rctx, post.Id, userID)
+		return a.PermanentDeletePostDataRetainStub(rctx, post, userID)
 	}
 
 	// If not the author, check read receipt

@@ -1014,6 +1014,11 @@ func (s *SqlPostStore) PermanentDelete(rctx request.CTX, postID string) (err err
 	return s.permanentDelete([]string{postID})
 }
 
+// 1. Thread
+// 2. Reactions
+// 3. TemporaryPosts
+// 4. ReadReceipts
+// 5. The Post itself
 func (s *SqlPostStore) permanentDelete(postIds []string) (err error) {
 	transaction, err := s.GetMaster().Beginx()
 	if err != nil {
@@ -1021,6 +1026,72 @@ func (s *SqlPostStore) permanentDelete(postIds []string) (err error) {
 	}
 	defer finalizeTransactionX(transaction, &err)
 
+	//if err = s.permanentDeleteThreads(transaction, postIds); err != nil {
+	//	return err
+	//}
+	//
+	//if err = s.permanentDeleteReactions(transaction, postIds); err != nil {
+	//	return err
+	//}
+	//
+	//if err = s.permanentDeleteTemporaryPosts(transaction, postIds); err != nil {
+	//	return err
+	//}
+	//
+	//if err = s.permanentDeleteReadReceipts(transaction, postIds); err != nil {
+	//	return err
+	//}
+	//
+	//query := s.getQueryBuilder().
+	//	Delete("Posts").
+	//	Where(
+	//		sq.Or{
+	//			sq.Eq{"Id": postIds},
+	//			sq.Eq{"RootId": postIds},
+	//		},
+	//	)
+	//if _, err = transaction.ExecBuilder(query); err != nil {
+	//	return errors.Wrap(err, "failed to delete Posts")
+	//}
+
+	if err := s.permanentDeleteAssociatedData(transaction, postIds); err != nil {
+		return err
+	}
+
+	query := s.getQueryBuilder().
+		Delete("Posts").
+		Where(sq.Eq{"Id": postIds})
+
+	if _, err = transaction.ExecBuilder(query); err != nil {
+		return errors.Wrap(err, "failed to delete Posts")
+	}
+
+	if err = transaction.Commit(); err != nil {
+		return errors.Wrap(err, "commit_transaction")
+	}
+
+	return nil
+}
+
+func (s *SqlPostStore) PermanentDeleteAssociatedData(postIds []string) error {
+	transaction, err := s.GetMaster().Beginx()
+	if err != nil {
+		return errors.Wrap(err, "begin_transaction")
+	}
+	defer finalizeTransactionX(transaction, &err)
+
+	if err := s.permanentDeleteAssociatedData(transaction, postIds); err != nil {
+		return err
+	}
+
+	if err = transaction.Commit(); err != nil {
+		return errors.Wrap(err, "commit_transaction")
+	}
+
+	return nil
+}
+
+func (s *SqlPostStore) permanentDeleteAssociatedData(transaction *sqlxTxWrapper, postIds []string) (err error) {
 	if err = s.permanentDeleteThreads(transaction, postIds); err != nil {
 		return err
 	}
@@ -1039,18 +1110,10 @@ func (s *SqlPostStore) permanentDelete(postIds []string) (err error) {
 
 	query := s.getQueryBuilder().
 		Delete("Posts").
-		Where(
-			sq.Or{
-				sq.Eq{"Id": postIds},
-				sq.Eq{"RootId": postIds},
-			},
-		)
+		Where(sq.Eq{"RootId": postIds})
+
 	if _, err = transaction.ExecBuilder(query); err != nil {
 		return errors.Wrap(err, "failed to delete Posts")
-	}
-
-	if err = transaction.Commit(); err != nil {
-		return errors.Wrap(err, "commit_transaction")
 	}
 
 	return nil
