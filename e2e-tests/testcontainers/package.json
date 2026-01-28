@@ -35,7 +35,6 @@
         "test-automation"
     ],
     "scripts": {
-        "postinstall": "npm run build",
         "build": "rollup -c --bundleConfigAsCjs",
         "postbuild": "chmod +x dist/cli.js",
         "build:watch": "npm run build -- --watch",
