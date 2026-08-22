@@ -62,7 +62,7 @@ Receive notifications of critical security updates. The sophistication of online
 ## Get involved
 
 - [Contribute to Mattermost](https://handbook.mattermost.com/contributors/contributors/ways-to-contribute)
-- [Find "Help Wanted" projects](https://github.com/mattermost/mattermost-server/issues?page=1&q=is%3Aissue+is%3Aopen+%22Help+Wanted%22&utf8=%E2%9C%93)
+- [Find "Help Wanted" projects](https://github.com/Unity-Billal-mesloub/mattermost/issues?page=1&q=is%3Aissue+is%3Aopen+%22Help+Wanted%22&utf8=%E2%9C%93)
 - [Join Developer Discussion on a Mattermost server for contributors](https://community.mattermost.com/signup_user_complete/?id=f1924a8db44ff3bb41c96424cdc20676)
 - [Get Help With Mattermost](https://docs.mattermost.com/guides/get-help.html)
 
@@ -72,24 +72,17 @@ Receive notifications of critical security updates. The sophistication of online
 - [See who's using Mattermost](https://mattermost.com/customers/)
 - [Browse over 700 Mattermost integrations](https://mattermost.com/marketplace/)
 
-## License
-
-See the [LICENSE file](LICENSE.txt) for license rights and limitations.
-
 ## Get the latest news
 
-- **X** - Follow [Mattermost on X, formerly Twitter](https://twitter.com/mattermost).
 - **Blog** - Get the latest updates from the [Mattermost blog](https://mattermost.com/blog/).
 - **Facebook** - Follow [Mattermost on Facebook](https://www.facebook.com/MattermostHQ).
 - **LinkedIn** - Follow [Mattermost on LinkedIn](https://www.linkedin.com/company/mattermost/).
 - **Email** - Subscribe to our [newsletter](https://mattermost.us11.list-manage.com/subscribe?u=6cdba22349ae374e188e7ab8e&id=2add1c8034) (1 or 2 per month).
 - **Mattermost** - Join the ~contributors channel on [the Mattermost Community Server](https://community.mattermost.com).
-- **IRC** - Join the #matterbridge channel on [Freenode](https://freenode.net/) (thanks to [matterircd](https://github.com/42wim/matterircd)).
+- **IRC** - Join the #matterbridge channel on [Freenode](https://freenode.net/) (thanks to [matterircd](https://github.com/Unity-Billal-mesloub/matterircd)).
 - **YouTube** -  Subscribe to [Mattermost](https://www.youtube.com/@MattermostHQ).
 
 ## Contributing
 
-[![Small Image](https://img.shields.io/badge/Contribute%20with-Gitpod-908a85?logo=gitpod)](https://gitpod.io/#https://github.com/mattermost/mattermost)
+[![Small Image](https://img.shields.io/badge/Contribute%20with-Gitpod-908a85?logo=gitpod)](https://gitpod.io/#https://github.com/Unity-Billal-mesloub/mattermost)
 
-Please see [CONTRIBUTING.md](./CONTRIBUTING.md).
-[Join the Mattermost Contributors server](https://community.mattermost.com/signup_user_complete/?id=codoy5s743rq5mk18i7u5ksz7e) to join community discussions about contributions, development, and more.
