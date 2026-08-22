@@ -1,3 +1,3 @@
-/webapp/channels/src/packages/mattermost-redux/src/store/configureStore.ts @hmhealey
-/server/channels/app/authentication.go @mattermost/product-security
-/server/channels/app/authorization.go @mattermost/product-security
+/webapp/channels/src/packages/mattermost-redux/src/store/configureStore.ts @Unity-Billal-mesloub
+/server/channels/app/authentication.go @Unity-Billal-mesloub
+/server/channels/app/authorization.go @Unity-Billal-mesloub
