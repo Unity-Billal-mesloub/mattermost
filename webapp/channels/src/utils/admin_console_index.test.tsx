@@ -21,7 +21,6 @@ describe('AdminConsoleIndex.generateIndex', () => {
             'environment/session_lengths',
             'authentication/mfa',
             'authentication/saml',
-            'experimental/features',
             'authentication/email',
             'authentication/ldap',
             'authentication/guest_access',
@@ -29,16 +28,22 @@ describe('AdminConsoleIndex.generateIndex', () => {
         expect(idx.search('saml')).toEqual([
             'authentication/saml',
             'environment/session_lengths',
-            'authentication/email',
             'environment/mobile_security',
-            'experimental/features',
+            'authentication/email',
         ]);
         expect(idx.search('nginx')).toEqual([
             'environment/rate_limiting',
         ]);
+        expect(idx.search('channel_viewed')).toEqual([
+            'environment/web_server',
+        ]);
         expect(idx.search('characters')).toEqual([
             'site_config/customization',
             'authentication/password',
+        ]);
+        expect(idx.search('typing')).toEqual([
+            'experimental/features',
+            'site_config/posts',
         ]);
         expect(idx.search('caracteres')).toEqual([]);
         expect(idx.search('notexistingword')).toEqual([]);
@@ -52,7 +57,6 @@ describe('AdminConsoleIndex.generateIndex', () => {
             'authentication/mfa',
             'authentication/ldap',
             'authentication/saml',
-            'experimental/features',
             'authentication/email',
             'environment/session_lengths',
             'authentication/guest_access',
@@ -61,7 +65,6 @@ describe('AdminConsoleIndex.generateIndex', () => {
             'authentication/saml',
             'environment/session_lengths',
             'authentication/email',
-            'experimental/features',
         ].sort());
         expect(idx.search('nginx')).toEqual([
             'environment/rate_limiting',
@@ -79,7 +82,7 @@ describe('AdminConsoleIndex.generateIndex', () => {
 
         const idx = generateIndex(AdminDefinition, intl, {[samplePlugin1.id]: samplePlugin1, [samplePlugin2.id]: samplePlugin2});
 
-        expect(idx.search('random')).toEqual(['plugin_Some-random-plugin', 'site_config/public_links']);
+        expect(idx.search('random')).toEqual(['site_config/users_and_teams', 'plugin_Some-random-plugin', 'site_config/public_links']);
         expect(idx.search('autolink')).toEqual(['plugin_mattermost-autolink']);
     });
 });

@@ -10,9 +10,11 @@
 // Stage: @prod
 // Group: @channels @enterprise @messaging
 
-import * as TIMEOUTS from '../../../fixtures/timeouts';
+import * as TIMEOUTS from '@/fixtures/timeouts';
 
-describe('Move thread', () => {
+// Skipped: MoveThreadsEnabled is retired and rejected by Config.IsValid (MM-69646).
+// These specs require the flag and cannot run while the server refuses to enable it.
+describe.skip('Move thread', () => {
     let user1;
     let user2;
     let user3;

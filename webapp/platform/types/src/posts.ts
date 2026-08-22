@@ -33,7 +33,9 @@ export type PostType = 'system_add_remove' |
 'reminder' |
 'system_wrangler' |
 'custom_spillage_report' |
+'system_autotranslation' |
 'burn_on_read' |
+'system_shared_chan_state' |
 '';
 
 export type PostEmbedType = 'image' | 'link' | 'message_attachment' | 'opengraph' | 'permalink';
@@ -55,18 +57,18 @@ export type PostAcknowledgement = {
     post_id: Post['id'];
     user_id: UserProfile['id'];
     acknowledged_at: number;
-}
+};
 
 export type PostPriorityMetadata = {
-    priority: PostPriority|'';
+    priority: PostPriority | '';
     requested_ack?: boolean;
     persistent_notifications?: boolean;
-}
+};
 
 export type PostTranslation = {
-    text: string;
-    type: string;
-    confidence?: number;
+    object?: {
+        message: string;
+    };
     state: 'ready' | 'skipped' | 'processing' | 'unavailable';
     source_lang?: string;
 };
@@ -82,6 +84,7 @@ export type PostMetadata = {
     translations?: Record<string, PostTranslation>;
     expire_at?: number;
     recipients?: string[];
+    redacted_file_count?: number;
 };
 
 export type Post = {
@@ -132,7 +135,7 @@ export type PostList = {
 
 export type PaginatedPostList = PostList & {
     has_next: boolean;
-}
+};
 
 export type PostSearchResults = PostList & {
     matches: RelationOneToOne<Post, string[]>;
@@ -176,7 +179,7 @@ export declare type OpenGraphMetadataImage = {
     type?: string;
     height?: number;
     width?: number;
-}
+};
 
 export declare type OpenGraphMetadata = {
     type?: string;
@@ -214,16 +217,16 @@ export type PostAnalytics = {
     post_id: string;
     user_actual_id: string;
     root_id: string;
-    priority?: PostPriority|'';
+    priority?: PostPriority | '';
     requested_ack?: boolean;
     persistent_notifications?: boolean;
-}
+};
 export type ActivityEntry = {
     postType: Post['type'];
     actorId: string[];
     userIds: string[];
     usernames: string[];
-}
+};
 
 export type PostInfo = {
     channel_id: string;
@@ -234,11 +237,11 @@ export type PostInfo = {
     team_type: TeamType;
     team_display_name: string;
     has_joined_team: boolean;
-}
+};
 
 export type NotificationStatus = 'error' | 'not_sent' | 'unsupported' | 'success';
 export type NotificationResult = {
     status: NotificationStatus;
     reason?: string;
     data?: string;
-}
+};

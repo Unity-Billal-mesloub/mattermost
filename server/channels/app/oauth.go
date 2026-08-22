@@ -5,7 +5,6 @@ package app
 
 import (
 	"bytes"
-	"context"
 	b64 "encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -285,6 +284,10 @@ func (a *App) GetOAuthAccessTokenForImplicitFlow(rctx request.CTX, userID string
 		return nil, err
 	}
 
+	if user.DeleteAt != 0 {
+		return nil, model.NewAppError("GetOAuthAccessToken", "api.oauth.get_access_token.expired_code.app_error", nil, "", http.StatusForbidden)
+	}
+
 	session, err := a.newSession(rctx, oauthApp, user)
 	if err != nil {
 		return nil, err
@@ -341,6 +344,10 @@ func (a *App) handleAuthorizationCodeGrant(rctx request.CTX, oauthApp *model.OAu
 		return nil, model.NewAppError("GetOAuthAccessToken", "api.oauth.get_access_token.expired_code.app_error", nil, "", http.StatusForbidden)
 	}
 
+	if authData.ClientId != clientId {
+		return nil, model.NewAppError("GetOAuthAccessToken", "api.oauth.get_access_token.client_id_mismatch.app_error", nil, "", http.StatusBadRequest)
+	}
+
 	if authData.RedirectUri != redirectURI {
 		return nil, model.NewAppError("GetOAuthAccessToken", "api.oauth.get_access_token.redirect_uri.app_error", nil, "", http.StatusBadRequest)
 	}
@@ -349,7 +356,7 @@ func (a *App) handleAuthorizationCodeGrant(rctx request.CTX, oauthApp *model.OAu
 		return nil, err
 	}
 
-	user, nErr := a.Srv().Store().User().Get(context.Background(), authData.UserId)
+	user, nErr := a.Srv().Store().User().Get(rctx, authData.UserId)
 	if nErr != nil {
 		return nil, model.NewAppError("GetOAuthAccessToken", "api.oauth.get_access_token.internal_user.app_error", nil, "", http.StatusNotFound).Wrap(nErr)
 	}
@@ -395,9 +402,17 @@ func (a *App) handleRefreshTokenGrant(rctx request.CTX, oauthApp *model.OAuthApp
 		return nil, model.NewAppError("GetOAuthAccessToken", "api.oauth.get_access_token.refresh_token.app_error", nil, "", http.StatusNotFound).Wrap(nErr)
 	}
 
-	user, nErr := a.Srv().Store().User().Get(context.Background(), accessData.UserId)
+	if accessData.ClientId != oauthApp.Id {
+		return nil, model.NewAppError("GetOAuthAccessToken", "api.oauth.get_access_token.client_id_mismatch.app_error", nil, "", http.StatusBadRequest)
+	}
+
+	user, nErr := a.Srv().Store().User().Get(rctx, accessData.UserId)
 	if nErr != nil {
 		return nil, model.NewAppError("GetOAuthAccessToken", "api.oauth.get_access_token.internal_user.app_error", nil, "", http.StatusNotFound).Wrap(nErr)
+	}
+
+	if user.DeleteAt != 0 {
+		return nil, model.NewAppError("GetOAuthAccessToken", "api.oauth.get_access_token.expired_code.app_error", nil, "", http.StatusForbidden)
 	}
 
 	audience := accessData.Audience // Default to existing audience
@@ -527,6 +542,8 @@ func (a *App) newSessionUpdateToken(rctx request.CTX, app *model.OAuthApp, acces
 	if err := a.Srv().Store().Session().Remove(accessData.Token); err != nil {
 		rctx.Logger().Warn("error removing access data token from session", mlog.Err(err))
 	}
+	// Clear the cache so the old token stops being accepted immediately.
+	a.ClearSessionCacheForUser(user.Id)
 
 	session, err := a.newSession(rctx, app, user)
 	if err != nil {
@@ -740,6 +757,7 @@ func (a *App) getSSOProvider(service string) (einterfaces.OAuthProvider, *model.
 	return provider, nil
 }
 
+// TODO: merge conflict, needs teamID string
 func (a *App) LoginByOAuth(rctx request.CTX, service string, userData io.Reader, inviteToken string, inviteId string, tokenUser *model.User) (*model.User, *model.AppError) {
 	provider, e := a.getSSOProvider(service)
 	if e != nil {
@@ -752,10 +770,16 @@ func (a *App) LoginByOAuth(rctx request.CTX, service string, userData io.Reader,
 			map[string]any{"Service": service}, "", http.StatusBadRequest)
 	}
 
-	authUser, err1 := provider.GetUserFromJSON(rctx, bytes.NewReader(buf.Bytes()), tokenUser)
-	if err1 != nil {
+	settings, err := provider.GetSSOSettings(rctx, a.Config(), service)
+	if err != nil {
+		return nil, model.NewAppError("LoginByOAuth", "api.user.oauth.get_settings.app_error",
+			map[string]any{"Service": service}, "", http.StatusBadRequest).Wrap(err)
+	}
+
+	authUser, err := provider.GetUserFromJSON(rctx, bytes.NewReader(buf.Bytes()), tokenUser, settings)
+	if err != nil {
 		return nil, model.NewAppError("LoginByOAuth", "api.user.login_by_oauth.parse.app_error",
-			map[string]any{"Service": service}, "", http.StatusBadRequest).Wrap(err1)
+			map[string]any{"Service": service}, "", http.StatusBadRequest).Wrap(err)
 	}
 
 	if *authUser.AuthData == "" {
@@ -763,12 +787,12 @@ func (a *App) LoginByOAuth(rctx request.CTX, service string, userData io.Reader,
 			map[string]any{"Service": service}, "", http.StatusBadRequest)
 	}
 
-	user, err := a.GetUserByAuth(model.NewPointer(*authUser.AuthData), service)
-	if err != nil {
-		if err.Id == MissingAuthAccountError {
-			user, err = a.CreateOAuthUser(rctx, service, bytes.NewReader(buf.Bytes()), inviteToken, inviteId, tokenUser)
+	user, appErr := a.GetUserByAuth(new(*authUser.AuthData), service)
+	if appErr != nil {
+		if appErr.Id == MissingAuthAccountError {
+			user, appErr = a.CreateOAuthUser(rctx, service, bytes.NewReader(buf.Bytes()), inviteToken, inviteId, tokenUser)
 		} else {
-			return nil, err
+			return nil, appErr
 		}
 	} else {
 		// OAuth doesn't run through CheckUserPreflightAuthenticationCriteria, so prevent bot login
@@ -778,17 +802,17 @@ func (a *App) LoginByOAuth(rctx request.CTX, service string, userData io.Reader,
 			return nil, model.NewAppError("loginByOAuth", "api.user.login_by_oauth.bot_login_forbidden.app_error", nil, "", http.StatusForbidden)
 		}
 
-		if err = a.UpdateOAuthUserAttrs(rctx, bytes.NewReader(buf.Bytes()), user, provider, service, tokenUser); err != nil {
-			return nil, err
+		if appErr = a.UpdateOAuthUserAttrs(rctx, bytes.NewReader(buf.Bytes()), user, provider, service, tokenUser); appErr != nil {
+			return nil, appErr
 		}
 
-		if err = a.AddUserToTeamByInviteIfNeeded(rctx, user, inviteToken, inviteId); err != nil {
-			rctx.Logger().Warn("Failed to add user to team", mlog.Err(err))
+		if appErr = a.AddUserToTeamByInviteIfNeeded(rctx, user, inviteToken, inviteId); appErr != nil {
+			rctx.Logger().Warn("Failed to add user to team", mlog.Err(appErr))
 		}
 	}
 
-	if err != nil {
-		return nil, err
+	if appErr != nil {
+		return nil, appErr
 	}
 
 	return user, nil
@@ -860,7 +884,13 @@ func (a *App) CompleteSwitchWithOAuth(rctx request.CTX, service string, userData
 		return nil, model.NewAppError("CompleteSwitchWithOAuth", "api.user.complete_switch_with_oauth.blank_email.app_error", nil, "", http.StatusBadRequest)
 	}
 
-	ssoUser, err1 := provider.GetUserFromJSON(rctx, userData, tokenUser)
+	settings, err := provider.GetSSOSettings(rctx, a.Config(), service)
+	if err != nil {
+		return nil, model.NewAppError("CompleteSwitchWithOAuth", "api.user.oauth.get_settings.app_error",
+			map[string]any{"Service": service}, "", http.StatusBadRequest).Wrap(err)
+	}
+
+	ssoUser, err1 := provider.GetUserFromJSON(rctx, userData, tokenUser, settings)
 	if err1 != nil {
 		return nil, model.NewAppError("CompleteSwitchWithOAuth", "api.user.complete_switch_with_oauth.parse.app_error",
 			map[string]any{"Service": service}, "", http.StatusBadRequest).Wrap(err1)
@@ -1180,6 +1210,10 @@ func (a *App) SwitchOAuthToEmail(rctx request.CTX, email, password, requesterId 
 		return "", model.NewAppError("oauthToEmail", "api.user.oauth_to_email.not_available.app_error", nil, "", http.StatusForbidden)
 	}
 
+	if rctx.Session().IsOAuth {
+		return "", model.NewAppError("SwitchOAuthToEmail", "api.user.oauth_to_email.integration_session.app_error", nil, "", http.StatusForbidden)
+	}
+
 	if !*a.Config().EmailSettings.EnableSignUpWithEmail {
 		return "", model.NewAppError("SwitchOAuthToEmail", "api.user.auth_switch.not_available.email_signup_disabled.app_error", nil, "", http.StatusForbidden)
 	}
@@ -1199,6 +1233,10 @@ func (a *App) SwitchOAuthToEmail(rctx request.CTX, email, password, requesterId 
 
 	if user.Id != requesterId {
 		return "", model.NewAppError("SwitchOAuthToEmail", "api.user.oauth_to_email.context.app_error", nil, "", http.StatusForbidden)
+	}
+
+	if !user.IsOAuthUser() && !user.IsSAMLUser() {
+		return "", model.NewAppError("SwitchOAuthToEmail", "api.user.oauth_to_email.not_oauth_user.app_error", nil, "", http.StatusBadRequest)
 	}
 
 	if err := a.UpdatePassword(rctx, user, password); err != nil {

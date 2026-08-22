@@ -41,6 +41,7 @@ import (
 	"github.com/mattermost/mattermost/server/v8/channels/jobs"
 	"github.com/mattermost/mattermost/server/v8/channels/jobs/active_users"
 	"github.com/mattermost/mattermost/server/v8/channels/jobs/cleanup_desktop_tokens"
+	"github.com/mattermost/mattermost/server/v8/channels/jobs/cleanup_expired_access_tokens"
 	"github.com/mattermost/mattermost/server/v8/channels/jobs/delete_dms_preferences_migration"
 	"github.com/mattermost/mattermost/server/v8/channels/jobs/delete_empty_drafts_migration"
 	"github.com/mattermost/mattermost/server/v8/channels/jobs/delete_expired_posts"
@@ -58,6 +59,7 @@ import (
 	"github.com/mattermost/mattermost/server/v8/channels/jobs/migrations"
 	"github.com/mattermost/mattermost/server/v8/channels/jobs/mobile_session_metadata"
 	"github.com/mattermost/mattermost/server/v8/channels/jobs/notify_admin"
+	"github.com/mattermost/mattermost/server/v8/channels/jobs/notify_expiring_access_tokens"
 	"github.com/mattermost/mattermost/server/v8/channels/jobs/plugins"
 	"github.com/mattermost/mattermost/server/v8/channels/jobs/post_persistent_notifications"
 	"github.com/mattermost/mattermost/server/v8/channels/jobs/product_notices"
@@ -65,6 +67,7 @@ import (
 	"github.com/mattermost/mattermost/server/v8/channels/jobs/refresh_materialized_views"
 	"github.com/mattermost/mattermost/server/v8/channels/jobs/resend_invitation_email"
 	"github.com/mattermost/mattermost/server/v8/channels/jobs/s3_path_migration"
+	"github.com/mattermost/mattermost/server/v8/channels/jobs/scheduled_recap"
 	"github.com/mattermost/mattermost/server/v8/channels/store"
 	"github.com/mattermost/mattermost/server/v8/channels/utils"
 	"github.com/mattermost/mattermost/server/v8/config"
@@ -125,6 +128,9 @@ type Server struct {
 	clusterLeaderListenerId string
 	loggerLicenseListenerId string
 
+	pushNotificationServerLicenseListenerId       string
+	pushNotificationServerClusterLeaderListenerId string
+
 	platform         *platform.PlatformService
 	platformOptions  []platform.Option
 	telemetryService *telemetry.TelemetryService
@@ -149,7 +155,25 @@ type Server struct {
 	PushProxy               einterfaces.PushProxyInterface
 	AutoTranslation         einterfaces.AutoTranslationInterface
 
+	agentsBridgeOverride AgentsBridge
+
 	ch *Channels
+
+	// cwsTokenOverride overrides CWS_CLOUD_TOKEN for CWS login authentication.
+	cwsTokenOverride string
+
+	// notifyAdminCoolOffDaysOverride overrides MM_NOTIFY_ADMIN_COOL_OFF_DAYS.
+	notifyAdminCoolOffDaysOverride string
+}
+
+// SetCWSTokenOverride sets the CWS token override for CWS login authentication.
+func (s *Server) SetCWSTokenOverride(v string) {
+	s.cwsTokenOverride = v
+}
+
+// SetNotifyAdminCoolOffDaysOverride sets the cool-off period override for admin notifications.
+func (s *Server) SetNotifyAdminCoolOffDaysOverride(v string) {
+	s.notifyAdminCoolOffDaysOverride = v
 }
 
 func (s *Server) Store() store.Store {
@@ -158,6 +182,10 @@ func (s *Server) Store() store.Store {
 	}
 
 	return nil
+}
+
+func (s *Server) PropertyService() *properties.PropertyService {
+	return s.propertyService
 }
 
 func (s *Server) SetStore(st store.Store) {
@@ -238,9 +266,27 @@ func NewServer(options ...Option) (*Server, error) {
 		PropertyGroupStore: s.Store().PropertyGroup(),
 		PropertyFieldStore: s.Store().PropertyField(),
 		PropertyValueStore: s.Store().PropertyValue(),
+		CallerIDExtractor: func(rctx request.CTX) string {
+			callerID, _ := CallerIDFromRequestContext(rctx)
+			return callerID
+		},
+		RequestOptionsExtractor: func(rctx request.CTX) model.PropertyRequestOptions {
+			return model.PropertyRequestOptionsFromContext(rctx.Context())
+		},
 	})
 	if err != nil {
 		return nil, errors.Wrapf(err, "unable to create properties service")
+	}
+
+	// Register builtin property groups before creating hooks that reference them
+	if err = s.propertyService.RegisterBuiltinGroups([]*model.PropertyGroup{
+		{Name: model.AccessControlPropertyGroupName, Version: model.PropertyGroupVersionV2, SchemaVersion: model.AccessControlPropertyGroupSchemaVersion},
+		{Name: model.SessionAttributesPropertyGroupName, Version: model.PropertyGroupVersionV2},
+		{Name: model.ContentFlaggingGroupName, Version: model.PropertyGroupVersionV1},
+		{Name: model.BoardsPropertyGroupName, Version: model.PropertyGroupVersionV2},
+		{Name: model.PostAttributesPropertyGroupName, Version: model.PropertyGroupVersionV2, SchemaVersion: model.PostAttributesPropertyGroupSchemaVersion},
+	}); err != nil {
+		return nil, errors.Wrap(err, "failed to register builtin property groups")
 	}
 
 	// It is important to initialize the hub only after the global logger is set
@@ -264,6 +310,77 @@ func NewServer(options ...Option) (*Server, error) {
 
 	// After channel is initialized set it to the App object
 	app := New(ServerConnector(channels))
+
+	// Register property-service hooks AFTER s.ch is populated. The
+	// access-control and attribute-validation hooks capture s and use
+	// s.ch for plugin-status and permission lookups; registering them
+	// earlier leaves a window where hook invocations race against a
+	// nil s.ch.
+	cpaGroup, err := s.propertyService.Group(model.AccessControlPropertyGroupName)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to look up CPA property group")
+	}
+
+	// License check hook — must run before other hooks so unlicensed
+	// operations are rejected early.
+	licenseCheckHook := properties.NewLicenseCheckHook(func() *model.License {
+		return s.License()
+	}, cpaGroup.ID)
+	s.propertyService.AddHook(licenseCheckHook)
+
+	accessControlHook := properties.NewAccessControlHook(s.propertyService, func(pluginID string) bool {
+		_, err := s.ch.GetPluginStatus(pluginID)
+		return err == nil
+	}, cpaGroup.ID)
+	s.propertyService.AddHook(accessControlHook)
+
+	// Attribute validation hook — validates visibility, sort_order on fields,
+	// field-type constraints on values (options, user IDs, value_type), and
+	// managed-flag authorization + permission level enforcement.
+	permChecker := func(userID string, perm *model.Permission) bool {
+		// Local-mode (unrestricted) sessions are tagged with
+		// CallerIDLocalAdmin by the HTTP layer; grant them admin
+		// permissions without a user lookup.
+		if userID == model.CallerIDLocalAdmin {
+			return true
+		}
+		return app.HasPermissionTo(userID, perm)
+	}
+	attrValidationHook := properties.NewAccessControlAttributeValidationHook(s.propertyService, permChecker, cpaGroup.ID)
+	s.propertyService.AddHook(attrValidationHook)
+
+	// Generic property value audit hook — groups opt in with RegisterGroup.
+	// The CPA group registers a content-level audit sink here.
+	valueAuditHook := properties.NewPropertyValueAuditHook()
+	valueAuditHook.RegisterGroup(cpaGroup.ID, app.auditCPAValueChange)
+	s.propertyService.AddHook(valueAuditHook)
+
+	// Field limit hook — enforces per-object-type and global field limits.
+	// Only "user" has a per-type cap today; when channel/team/post CPA fields
+	// are added, set their per-type caps here. Until then
+	// AccessControlGroupFieldLimit is the only ceiling for non-user
+	// object types within this group.
+	fieldLimitHook := properties.NewFieldLimitHook(s.propertyService)
+	fieldLimitHook.AddGroupLimit(cpaGroup.ID, &properties.FieldLimitConfig{
+		PerObjectType: map[string]int64{
+			model.PropertyFieldObjectTypeUser: 20,
+		},
+		GlobalLimit: model.AccessControlGroupFieldLimit,
+	})
+	s.propertyService.AddHook(fieldLimitHook)
+
+	// Session attributes schema guard — blocks deletion and restricts edits to the tunable Attrs.
+	saGroup, err := s.propertyService.Group(model.SessionAttributesPropertyGroupName)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to look up session attributes property group")
+	}
+	s.propertyService.AddHook(properties.NewSessionAttributesHook(s.propertyService, saGroup.ID))
+
+	// Type-change value cleanup — registered last so the field write has
+	// passed every other gate (license, access control, validation, limit)
+	// before we cascade-delete dependent values. PostUpdate hooks run after
+	// the store write succeeds.
+	s.propertyService.AddHook(properties.NewTypeChangeValueCleanupHook(s.propertyService))
 
 	// -------------------------------------------------------------------------
 	// Everything below this is not order sensitive and safe to be moved around.
@@ -323,17 +440,17 @@ func NewServer(options ...Option) (*Server, error) {
 
 	s.createPushNotificationsHub(request.EmptyContext(s.Log()))
 
-	if err2 := i18n.InitTranslations(*s.platform.Config().LocalizationSettings.DefaultServerLocale, *s.platform.Config().LocalizationSettings.DefaultClientLocale); err2 != nil {
-		return nil, errors.Wrapf(err2, "unable to load Mattermost translation files")
+	if err = i18n.InitTranslations(*s.platform.Config().LocalizationSettings.DefaultServerLocale, *s.platform.Config().LocalizationSettings.DefaultClientLocale); err != nil {
+		return nil, errors.Wrapf(err, "unable to load Mattermost translation files")
 	}
 
 	templatesDir, ok := templates.GetTemplateDirectory()
 	if !ok {
 		return nil, errors.New("Failed find server templates in \"templates\" directory")
 	}
-	htmlTemplates, err2 := templates.New(templatesDir)
-	if err2 != nil {
-		return nil, errors.Wrap(err2, "cannot initialize server templates")
+	htmlTemplates, err := templates.New(templatesDir)
+	if err != nil {
+		return nil, errors.Wrap(err, "cannot initialize server templates")
 	}
 	s.htmlTemplates = htmlTemplates
 
@@ -350,6 +467,7 @@ func NewServer(options ...Option) (*Server, error) {
 		TemplatesContainer: s.TemplatesContainer(),
 		UserService:        s.userService,
 		Store:              s.GetStore(),
+		Logger:             s.Log(),
 	})
 	if err != nil {
 		return nil, errors.Wrapf(err, "unable to initialize email service")
@@ -369,7 +487,7 @@ func NewServer(options ...Option) (*Server, error) {
 	}
 
 	s.clusterLeaderListenerId = s.AddClusterLeaderChangedListener(func() {
-		mlog.Info("Cluster leader changed. Determining if job schedulers should be running:", mlog.Bool("isLeader", s.IsLeader()))
+		mlog.Info("Cluster leader changed. Determining if job schedulers should be running:", mlog.Bool("is_leader", s.IsLeader()))
 		if s.Jobs != nil {
 			s.Jobs.HandleClusterLeaderChange(s.IsLeader())
 		}
@@ -391,9 +509,11 @@ func NewServer(options ...Option) (*Server, error) {
 		}
 	}
 
-	// Start email batching because it's not like the other jobs
-	s.platform.AddConfigListener(func(_, _ *model.Config) {
-		s.EmailService.InitEmailBatching()
+	// Re-init email batching only when its enable flag or interval changes.
+	s.platform.AddConfigListener(func(oldCfg, newCfg *model.Config) {
+		if emailBatchingSettingChanged(oldCfg, newCfg) {
+			s.EmailService.InitEmailBatching()
+		}
 	})
 
 	pwd, _ := os.Getwd()
@@ -411,12 +531,27 @@ func NewServer(options ...Option) (*Server, error) {
 		}
 	}
 
+	if cfg := s.platform.Config(); cfg.AccessControlSettings.EnableAccessControlAuditLogging != nil &&
+		*cfg.AccessControlSettings.EnableAccessControlAuditLogging &&
+		!config.IsAuditLoggingActive(cfg.ExperimentalAuditSettings, allowAdvancedLogging) {
+		mlog.Warn("AccessControlSettings.EnableAccessControlAuditLogging is enabled but no active audit log target is configured; ABAC policy-decision audit logging will have no effect. Enable ExperimentalAuditSettings.FileEnabled or configure an advanced audit logging target bound to an audit level.")
+	}
+
 	s.platform.RemoveUnlicensedLogTargets(license)
 	s.platform.EnableLoggingMetrics()
 
 	s.loggerLicenseListenerId = s.AddLicenseListener(func(oldLicense, newLicense *model.License) {
 		s.platform.RemoveUnlicensedLogTargets(newLicense)
 		s.platform.EnableLoggingMetrics()
+	})
+
+	// Keep the push notification server in sync with the license's HPNS entitlement, and let a
+	// newly-elected cluster leader repair any transition missed while another node was leader.
+	s.pushNotificationServerLicenseListenerId = s.AddLicenseListener(func(oldLicense, newLicense *model.License) {
+		s.syncPushNotificationServerWithLicense()
+	})
+	s.pushNotificationServerClusterLeaderListenerId = s.AddClusterLeaderChangedListener(func() {
+		s.syncPushNotificationServerWithLicense()
 	})
 
 	// if enabled - perform initial product notices fetch
@@ -477,9 +612,7 @@ func NewServer(options ...Option) (*Server, error) {
 	// Dump the image cache if the proxy settings have changed. (need switch URLs to the correct proxy)
 	s.platform.AddConfigListener(func(oldCfg, newCfg *model.Config) {
 		if (oldCfg.ImageProxySettings.Enable != newCfg.ImageProxySettings.Enable) ||
-			(oldCfg.ImageProxySettings.ImageProxyType != newCfg.ImageProxySettings.ImageProxyType) ||
-			(oldCfg.ImageProxySettings.RemoteImageProxyURL != newCfg.ImageProxySettings.RemoteImageProxyURL) ||
-			(oldCfg.ImageProxySettings.RemoteImageProxyOptions != newCfg.ImageProxySettings.RemoteImageProxyOptions) {
+			(oldCfg.ImageProxySettings.ImageProxyType != newCfg.ImageProxySettings.ImageProxyType) {
 			if err = s.openGraphDataCache.Purge(); err != nil {
 				mlog.Error("Failed to purge Open Graph data cache after config change", mlog.Err(err))
 			}
@@ -648,6 +781,8 @@ func (s *Server) Shutdown() {
 
 	s.RemoveLicenseListener(s.loggerLicenseListenerId)
 	s.RemoveClusterLeaderChangedListener(s.clusterLeaderListenerId)
+	s.RemoveLicenseListener(s.pushNotificationServerLicenseListenerId)
+	s.RemoveClusterLeaderChangedListener(s.pushNotificationServerClusterLeaderListenerId)
 
 	var err error
 	s.serviceMux.RLock()
@@ -783,6 +918,14 @@ func (s *Server) GoBuffered(f func()) {
 	s.platform.GoBuffered(f)
 }
 
+// GoExtraction submits f to the bounded document extraction worker pool without
+// blocking the caller. It returns false if the pool is saturated and f was not
+// run; skipped files stay unextracted until the scheduled ExtractContent catch-up
+// job or an admin runs a content extraction job (e.g. mmctl extract).
+func (s *Server) GoExtraction(f func()) bool {
+	return s.platform.GoExtraction(f)
+}
+
 var corsAllowedMethods = []string{
 	"POST",
 	"GET",
@@ -812,6 +955,12 @@ func stripPort(hostport string) string {
 }
 
 func (s *Server) Start() error {
+	// Start inter-cluster services first so shared channels APIs are
+	// available when plugins activate during channels startup.
+	if err := s.startInterClusterServices(s.License()); err != nil {
+		mlog.Error("Error starting inter-cluster services", mlog.Err(err))
+	}
+
 	// Start channels.
 	// This needs to happen before because channels is dependent on the HTTP server.
 	if err := s.Channels().Start(); err != nil {
@@ -849,13 +998,33 @@ func (s *Server) Start() error {
 
 	err := s.FileBackend().TestConnection()
 	if err != nil {
-		if _, ok := err.(*filestore.S3FileBackendNoBucketError); ok {
-			err = s.FileBackend().(*filestore.S3FileBackend).MakeBucket()
+		var noBucket *filestore.FileBackendNoBucketError
+		if errors.As(err, &noBucket) {
+			// Each backend exposes its own provisioning entry point, so
+			// dispatch by capability rather than concrete type. New
+			// backends opt in by implementing this interface; backends
+			// that do not are reported with the original error so the
+			// missing-bucket condition surfaces in logs instead of being
+			// silently swallowed.
+			type bucketMaker interface {
+				MakeBucket() error
+			}
+			type containerMaker interface {
+				MakeContainer() error
+			}
+			switch b := s.FileBackend().(type) {
+			case bucketMaker:
+				err = b.MakeBucket()
+			case containerMaker:
+				err = b.MakeContainer()
+			}
 		}
 		if err != nil {
 			mlog.Error("Problem with file storage settings", mlog.Err(err))
 		}
 	}
+
+	s.syncPushNotificationServerWithLicense()
 
 	s.checkPushNotificationServerURL()
 
@@ -1067,10 +1236,6 @@ func (s *Server) Start() error {
 		if err := s.startLocalModeServer(); err != nil {
 			mlog.Fatal(err.Error())
 		}
-	}
-
-	if err := s.startInterClusterServices(s.License()); err != nil {
-		mlog.Error("Error starting inter-cluster services", mlog.Err(err))
 	}
 
 	return nil
@@ -1306,17 +1471,7 @@ func (s *Server) sendLicenseUpForRenewalEmail(users map[string]*model.User, lice
 	countNotOks := 0
 
 	for _, user := range users {
-		name := user.FirstName
-		if name == "" {
-			name = user.Username
-		}
-		T := i18n.GetUserTranslations(user.Locale)
-
-		ctaTitle := ""
-		ctaText := T("api.templates.license_up_for_renewal_contact_sales")
-		ctaLink := "https://mattermost.com/contact-sales/"
-
-		if err := s.EmailService.SendLicenseUpForRenewalEmail(user.Email, name, user.Locale, *s.platform.Config().ServiceSettings.SiteURL, ctaTitle, ctaLink, ctaText, daysToExpiration); err != nil {
+		if err := s.EmailService.SendLicenseUpForRenewalEmail(user.Email, user.Locale, daysToExpiration); err != nil {
 			mlog.Error("Error sending license up for renewal email to", mlog.String("user_email", user.Email), mlog.Err(err))
 			countNotOks++
 		}
@@ -1406,16 +1561,10 @@ func (s *Server) doLicenseExpirationCheck() {
 			continue
 		}
 
-		T := i18n.GetUserTranslations(user.Locale)
-		ctaText := T("api.templates.license_up_for_renewal_contact_sales")
-		ctaLink := "https://mattermost.com/contact-sales/"
-
 		mlog.Debug("Sending license expired email.", mlog.String("user_email", user.Email))
-		s.Go(func() {
-			if err := s.SendRemoveExpiredLicenseEmail(user.Email, ctaText, ctaLink, user.Locale, *s.platform.Config().ServiceSettings.SiteURL); err != nil {
-				mlog.Error("Error while sending the license expired email.", mlog.String("user_email", user.Email), mlog.Err(err))
-			}
-		})
+		if err := s.SendRemoveExpiredLicenseEmail(user.Email, user.Locale); err != nil {
+			mlog.Error("Error while sending the license expired email.", mlog.String("user_email", user.Email), mlog.Err(err))
+		}
 	}
 
 	// remove the license
@@ -1424,10 +1573,8 @@ func (s *Server) doLicenseExpirationCheck() {
 	}
 }
 
-// SendRemoveExpiredLicenseEmail formats an email and uses the email service to send the email to user with link pointing to CWS
-// to renew the user license
-func (s *Server) SendRemoveExpiredLicenseEmail(email, ctaText, ctaLink, locale, siteURL string) *model.AppError {
-	if err := s.EmailService.SendRemoveExpiredLicenseEmail(ctaText, ctaLink, email, locale, siteURL); err != nil {
+func (s *Server) SendRemoveExpiredLicenseEmail(email, locale string) *model.AppError {
+	if err := s.EmailService.SendRemoveExpiredLicenseEmail(email, locale); err != nil {
 		return model.NewAppError("SendRemoveExpiredLicenseEmail", "api.license.remove_expired_license.failed.error", nil, "", http.StatusInternalServerError).Wrap(err)
 	}
 
@@ -1451,7 +1598,7 @@ func (ch *Channels) ClientConfigHash() string {
 }
 
 func (s *Server) initJobs() {
-	s.Jobs = jobs.NewJobServer(s.platform, s.Store(), s.GetMetrics(), s.Log())
+	s.Jobs = jobs.NewJobServer(s.platform, s.Store(), s.GetMetrics(), s.Log(), s.platform.Publish)
 
 	if jobsDataRetentionJobInterface != nil {
 		builder := jobsDataRetentionJobInterface(s)
@@ -1483,9 +1630,20 @@ func (s *Server) initJobs() {
 		s.Jobs.RegisterJobType(model.JobTypeAccessControlSync, builder.MakeWorker(), builder.MakeScheduler())
 	}
 
+	if jobsAccessControlTeamSyncJobInterface != nil {
+		builder := jobsAccessControlTeamSyncJobInterface(s)
+		s.Jobs.RegisterJobType(model.JobTypeAccessControlTeamSync, builder.MakeWorker(), builder.MakeScheduler())
+	}
+
 	if pushProxyInterface != nil {
 		builder := pushProxyInterface(New(ServerConnector(s.Channels())))
 		s.Jobs.RegisterJobType(model.JobTypePushProxyAuth, builder.MakeWorker(), builder.MakeScheduler())
+	}
+
+	if s.AutoTranslation != nil {
+		s.Jobs.RegisterJobType(model.JobTypeAutoTranslationRecovery,
+			s.AutoTranslation.MakeWorker(),
+			s.AutoTranslation.MakeScheduler())
 	}
 
 	s.Jobs.RegisterJobType(
@@ -1572,7 +1730,7 @@ func (s *Server) initJobs() {
 	s.Jobs.RegisterJobType(
 		model.JobTypeExtractContent,
 		extract_content.MakeWorker(s.Jobs, New(ServerConnector(s.Channels())), s.Store()),
-		nil,
+		extract_content.MakeScheduler(s.Jobs),
 	)
 
 	s.Jobs.RegisterJobType(
@@ -1624,6 +1782,18 @@ func (s *Server) initJobs() {
 	)
 
 	s.Jobs.RegisterJobType(
+		model.JobTypeCleanupExpiredAccessTokens,
+		cleanup_expired_access_tokens.MakeWorker(s.Jobs, s.platform.ClearUserSessionCache, New(ServerConnector(s.Channels())).NotifyExpiredAccessTokensDeleted),
+		cleanup_expired_access_tokens.MakeScheduler(s.Jobs),
+	)
+
+	s.Jobs.RegisterJobType(
+		model.JobTypeNotifyExpiringAccessTokens,
+		notify_expiring_access_tokens.MakeWorker(s.Jobs, New(ServerConnector(s.Channels())).NotifyExpiringAccessTokens),
+		notify_expiring_access_tokens.MakeScheduler(s.Jobs),
+	)
+
+	s.Jobs.RegisterJobType(
 		model.JobTypeRefreshMaterializedViews,
 		refresh_materialized_views.MakeWorker(s.Jobs, *s.platform.Config().SqlSettings.DriverName),
 		refresh_materialized_views.MakeScheduler(s.Jobs, *s.platform.Config().SqlSettings.DriverName),
@@ -1644,6 +1814,12 @@ func (s *Server) initJobs() {
 		model.JobTypeRecap,
 		recap.MakeWorker(s.Jobs, s.Store(), New(ServerConnector(s.Channels()))),
 		nil,
+	)
+
+	s.Jobs.RegisterJobType(
+		model.JobTypeScheduledRecap,
+		scheduled_recap.MakeWorker(s.Jobs, s.Store(), New(ServerConnector(s.Channels()))),
+		scheduled_recap.MakeScheduler(s.Jobs, s.Store()),
 	)
 
 	s.Jobs.RegisterJobType(
@@ -1800,13 +1976,13 @@ func runDNDStatusExpireJob(a *App) {
 	}
 
 	a.ch.srv.AddClusterLeaderChangedListener(func() {
-		mlog.Info("Cluster leader changed. Determining if unset DNS status task should be running", mlog.Bool("isLeader", a.IsLeader()))
+		mlog.Info("Cluster leader changed. Determining if unset DNS status task should be running", mlog.Bool("is_leader", a.IsLeader()))
 		if a.IsLeader() {
 			withMut(&a.ch.dndTaskMut, func() {
 				a.ch.dndTask = model.CreateRecurringTaskFromNextIntervalTime("Unset DND Statuses", a.UpdateDNDStatusOfUsers, model.DNDExpiryInterval)
 			})
 		} else {
-			mlog.Debug("This is no longer leader node. Cancelling the unset DND status task", mlog.Bool("isLeader", a.IsLeader()))
+			mlog.Debug("This is no longer leader node. Cancelling the unset DND status task", mlog.Bool("is_leader", a.IsLeader()))
 			cancelTask(&a.ch.dndTaskMut, &a.ch.dndTask)
 		}
 	})
@@ -1824,7 +2000,7 @@ func runPostReminderJob(a *App) {
 	}
 
 	a.ch.srv.AddClusterLeaderChangedListener(func() {
-		mlog.Info("Cluster leader changed. Determining if post reminder task should be running", mlog.Bool("isLeader", a.IsLeader()))
+		mlog.Info("Cluster leader changed. Determining if post reminder task should be running", mlog.Bool("is_leader", a.IsLeader()))
 		if a.IsLeader() {
 			rctx := request.EmptyContext(a.Log())
 			withMut(&a.ch.postReminderMut, func() {
@@ -1832,7 +2008,7 @@ func runPostReminderJob(a *App) {
 				a.ch.postReminderTask = model.CreateRecurringTaskFromNextIntervalTime("Check Post reminders", fn, 5*time.Minute)
 			})
 		} else {
-			mlog.Debug("This is no longer leader node. Cancelling the post reminder task", mlog.Bool("isLeader", a.IsLeader()))
+			mlog.Debug("This is no longer leader node. Cancelling the post reminder task", mlog.Bool("is_leader", a.IsLeader()))
 			cancelTask(&a.ch.postReminderMut, &a.ch.postReminderTask)
 		}
 	})
@@ -1846,11 +2022,11 @@ func runScheduledPostJob(a *App) {
 	}
 
 	a.ch.srv.AddClusterLeaderChangedListener(func() {
-		mlog.Info("Cluster leader changed. Determining if scheduled posts task should be running", mlog.Bool("isLeader", a.IsLeader()))
+		mlog.Info("Cluster leader changed. Determining if scheduled posts task should be running", mlog.Bool("is_leader", a.IsLeader()))
 		if a.IsLeader() {
 			doRunScheduledPostJob(a)
 		} else {
-			mlog.Debug("This is no longer leader node. Cancelling the scheduled post task", mlog.Bool("isLeader", a.IsLeader()))
+			mlog.Debug("This is no longer leader node. Cancelling the scheduled post task", mlog.Bool("is_leader", a.IsLeader()))
 			cancelTask(&a.ch.scheduledPostMut, &a.ch.scheduledPostTask)
 		}
 	})
@@ -1886,4 +2062,14 @@ func (s *Server) Platform() *platform.PlatformService {
 
 func (s *Server) Log() *mlog.Logger {
 	return s.platform.Logger()
+}
+
+func emailBatchingSettingChanged(oldCfg, newCfg *model.Config) bool {
+	if oldCfg == nil || newCfg == nil {
+		return true
+	}
+	return model.SafeDereference(oldCfg.EmailSettings.EnableEmailBatching) !=
+		model.SafeDereference(newCfg.EmailSettings.EnableEmailBatching) ||
+		model.SafeDereference(oldCfg.EmailSettings.EmailBatchingInterval) !=
+			model.SafeDereference(newCfg.EmailSettings.EmailBatchingInterval)
 }

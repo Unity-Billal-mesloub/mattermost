@@ -15,7 +15,7 @@ import {formatAsString} from 'utils/i18n';
 type OptionType = {
     label: string | JSX.Element;
     value: string;
-}
+};
 
 type Props<T extends OptionType> = Omit<SelectProps<T, false>, 'onChange' | 'onInputChange' | 'isMulti' | 'placeholder'> & {
     value: T;
@@ -233,7 +233,7 @@ const DropdownInputHybrid = <T extends OptionType = OptionType>(props: Props<T>)
                         placeholder={focused ? '' : formatAsString(intl.formatMessage, placeholder)}
                         components={{
                             IndicatorsContainer,
-                            Option: Option as React.ComponentType<OptionProps<T, false, GroupBase<T>>>,
+                            Option,
                             Control,
                         }}
                         className={classNames('Input', className, {Input__focus: showLegend})}

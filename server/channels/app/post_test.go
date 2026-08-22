@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -30,7 +31,7 @@ import (
 func enableBoRFeature(th *TestHelper) {
 	th.App.Srv().SetLicense(model.NewTestLicenseSKU(model.LicenseShortSkuEnterpriseAdvanced))
 	th.App.UpdateConfig(func(cfg *model.Config) {
-		cfg.ServiceSettings.EnableBurnOnRead = model.NewPointer(true)
+		cfg.ServiceSettings.EnableBurnOnRead = new(true)
 	})
 }
 
@@ -168,9 +169,7 @@ func TestCreatePostDeduplicate(t *testing.T) {
 
 		// Launch a goroutine to make the first CreatePost call that will get delayed
 		// by the plugin above.
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			var appErr *model.AppError
 			post, _, appErr = th.App.CreatePostAsUser(th.Context.WithSession(session), &model.Post{
 				UserId:        th.BasicUser.Id,
@@ -180,7 +179,7 @@ func TestCreatePostDeduplicate(t *testing.T) {
 			}, session.Id, true)
 			require.Nil(t, appErr)
 			require.Equal(t, post.Message, "plugin delayed")
-		}()
+		})
 
 		// Give the goroutine above a chance to start and get delayed by the plugin.
 		time.Sleep(2 * time.Second)
@@ -315,7 +314,7 @@ func TestAttachFilesToPost(t *testing.T) {
 		assert.Contains(t, attachedFiles, info1.Id)
 		assert.Contains(t, attachedFiles, info2.Id)
 
-		infos, _, appErr := th.App.GetFileInfosForPost(th.Context, post.Id, false, false)
+		infos, _, appErr := th.App.GetFileInfosForPost(th.Context, post, false, false)
 		assert.Nil(t, appErr)
 		assert.Len(t, infos, 2)
 	})
@@ -346,7 +345,7 @@ func TestAttachFilesToPost(t *testing.T) {
 		assert.Len(t, attachedFiles, 1)
 		assert.Contains(t, attachedFiles, info2.Id)
 
-		infos, _, appErr := th.App.GetFileInfosForPost(th.Context, post.Id, false, false)
+		infos, _, appErr := th.App.GetFileInfosForPost(th.Context, post, false, false)
 		assert.Nil(t, appErr)
 		assert.Len(t, infos, 1)
 		assert.Equal(t, info2.Id, infos[0].Id)
@@ -652,6 +651,9 @@ func TestPostChannelMentions(t *testing.T) {
 	channel := th.BasicChannel
 	user := th.BasicUser
 
+	// Create context with session for the user to properly test sanitization
+	ctx := th.Context.WithSession(&model.Session{UserId: user.Id})
+
 	channelToMention, err := th.App.CreateChannel(th.Context, &model.Channel{
 		DisplayName: "Mention Test",
 		Name:        "mention-test",
@@ -686,7 +688,7 @@ func TestPostChannelMentions(t *testing.T) {
 		CreateAt:      0,
 	}
 
-	post, _, err = th.App.CreatePostAsUser(th.Context, post, "", true)
+	post, _, err = th.App.CreatePostAsUser(ctx, post, "", true)
 	require.Nil(t, err)
 	assert.Equal(t, map[string]any{
 		"mention-test": map[string]any{
@@ -696,7 +698,7 @@ func TestPostChannelMentions(t *testing.T) {
 	}, post.GetProp(model.PostPropsChannelMentions))
 
 	post.Message = fmt.Sprintf("goodbye, ~%v!", channelToMention2.Name)
-	result, isMemberForPreviews, err := th.App.UpdatePost(th.Context, post, nil)
+	result, isMemberForPreviews, err := th.App.UpdatePost(ctx, post, nil)
 	require.True(t, isMemberForPreviews)
 	require.Nil(t, err)
 	assert.Equal(t, map[string]any{
@@ -707,10 +709,164 @@ func TestPostChannelMentions(t *testing.T) {
 	}, result.GetProp(model.PostPropsChannelMentions))
 
 	result.Message = "no more mentions!"
-	result, isMemberForPreviews, err = th.App.UpdatePost(th.Context, result, nil)
+	result, isMemberForPreviews, err = th.App.UpdatePost(ctx, result, nil)
 	require.True(t, isMemberForPreviews)
 	require.Nil(t, err)
 	assert.Nil(t, result.GetProp(model.PostPropsChannelMentions))
+}
+
+// TestFillInPostPropsChannelMentionResolution locks in the author-side persistence of the
+// channel_mentions prop after FillInPostProps switched from HasPermissionToReadChannel to
+// HasPermissionToResolveChannelMention. The post author is the subject of every case.
+func TestFillInPostPropsChannelMentionResolution(t *testing.T) {
+	mainHelper.Parallel(t)
+	th := Setup(t).InitBasic(t)
+
+	// Author is a member of BasicTeam (and BasicChannel) but NOT of the referenced channels below.
+	author := th.BasicUser
+	postChannel := th.BasicChannel
+
+	// Public channel on the author's team where the author is NOT a member.
+	// Created with membership=false so the creator is not added as a member.
+	publicNonMember, err := th.App.CreateChannel(th.Context, &model.Channel{
+		DisplayName: "Public Non-Member",
+		Name:        "public-non-member-" + model.NewId(),
+		Type:        model.ChannelTypeOpen,
+		TeamId:      th.BasicTeam.Id,
+	}, false)
+	require.Nil(t, err)
+
+	// Private channel on the author's team where the author is NOT a member.
+	privateNonMember, err := th.App.CreateChannel(th.Context, &model.Channel{
+		DisplayName: "Private Non-Member",
+		Name:        "private-non-member-" + model.NewId(),
+		Type:        model.ChannelTypePrivate,
+		TeamId:      th.BasicTeam.Id,
+	}, false)
+	require.Nil(t, err)
+
+	// Public channel on the author's team where the author IS a member.
+	publicMember, err := th.App.CreateChannel(th.Context, &model.Channel{
+		DisplayName: "Public Member",
+		Name:        "public-member-" + model.NewId(),
+		Type:        model.ChannelTypeOpen,
+		TeamId:      th.BasicTeam.Id,
+	}, false)
+	require.Nil(t, err)
+	_, err = th.App.AddUserToChannel(th.Context, author, publicMember, false)
+	require.Nil(t, err)
+
+	// A second team the author does NOT belong to, with a public channel on it. The post used for
+	// the cross-team case lives on this team so that GetChannelsByNames (scoped to the post's team)
+	// actually resolves the channel and the permission check is what drops it.
+	otherTeam := th.CreateTeam(t)
+	otherTeamPublic, err := th.App.CreateChannel(th.Context, &model.Channel{
+		DisplayName: "Other Team Public",
+		Name:        "other-team-public-" + model.NewId(),
+		Type:        model.ChannelTypeOpen,
+		TeamId:      otherTeam.Id,
+	}, false)
+	require.Nil(t, err)
+	otherTeamPostChannel, err := th.App.CreateChannel(th.Context, &model.Channel{
+		DisplayName: "Other Team Post Channel",
+		Name:        "other-team-post-" + model.NewId(),
+		Type:        model.ChannelTypeOpen,
+		TeamId:      otherTeam.Id,
+	}, false)
+	require.Nil(t, err)
+
+	setCompliance := func(enabled bool) {
+		th.App.UpdateConfig(func(c *model.Config) {
+			c.ComplianceSettings.Enable = model.NewPointer(enabled)
+		})
+	}
+
+	// resolve runs FillInPostProps for a post authored by `author` mentioning the given channels in
+	// `inChannel`, and returns the persisted channel_mentions map (or nil).
+	resolve := func(t *testing.T, inChannel *model.Channel, mentioned ...*model.Channel) map[string]any {
+		t.Helper()
+		var builder strings.Builder
+		builder.WriteString("hello")
+		for _, m := range mentioned {
+			fmt.Fprintf(&builder, " ~%s", m.Name)
+		}
+		message := builder.String()
+		post := &model.Post{
+			Message:   message,
+			ChannelId: inChannel.Id,
+			UserId:    author.Id,
+		}
+		appErr := th.App.FillInPostProps(th.Context, post, inChannel)
+		require.Nil(t, appErr)
+
+		prop := post.GetProp(model.PostPropsChannelMentions)
+		if prop == nil {
+			return nil
+		}
+		mentions, ok := prop.(map[string]any)
+		require.True(t, ok)
+		return mentions
+	}
+
+	assertResolved := func(t *testing.T, mentions map[string]any, channel *model.Channel, teamName string) {
+		t.Helper()
+		require.Contains(t, mentions, channel.Name)
+		entry, ok := mentions[channel.Name].(map[string]any)
+		require.True(t, ok)
+		assert.Equal(t, channel.DisplayName, entry["display_name"])
+		assert.Equal(t, teamName, entry["team_name"])
+	}
+
+	t.Run("public channel, author is a team member but not a channel member, compliance ON => persisted", func(t *testing.T) {
+		setCompliance(true)
+		defer setCompliance(false)
+
+		mentions := resolve(t, postChannel, publicNonMember)
+		require.NotNil(t, mentions, "channel_mentions prop must be persisted under compliance")
+		assertResolved(t, mentions, publicNonMember, th.BasicTeam.Name)
+	})
+
+	t.Run("public channel, author is a team member but not a channel member, compliance OFF => persisted", func(t *testing.T) {
+		setCompliance(false)
+
+		mentions := resolve(t, postChannel, publicNonMember)
+		require.NotNil(t, mentions)
+		assertResolved(t, mentions, publicNonMember, th.BasicTeam.Name)
+	})
+
+	t.Run("public channel on a team the author does not belong to => not persisted", func(t *testing.T) {
+		setCompliance(false)
+
+		mentions := resolve(t, otherTeamPostChannel, otherTeamPublic)
+		assert.Nil(t, mentions)
+	})
+
+	t.Run("private channel the author is not a member of => not persisted", func(t *testing.T) {
+		setCompliance(false)
+
+		mentions := resolve(t, postChannel, privateNonMember)
+		assert.Nil(t, mentions)
+	})
+
+	t.Run("channel the author is a member of => persisted", func(t *testing.T) {
+		setCompliance(true)
+		defer setCompliance(false)
+
+		mentions := resolve(t, postChannel, publicMember)
+		require.NotNil(t, mentions)
+		assertResolved(t, mentions, publicMember, th.BasicTeam.Name)
+	})
+
+	t.Run("mixed mentions resolve per-channel boundary", func(t *testing.T) {
+		setCompliance(true)
+		defer setCompliance(false)
+
+		mentions := resolve(t, postChannel, publicNonMember, privateNonMember, publicMember)
+		require.NotNil(t, mentions)
+		assertResolved(t, mentions, publicNonMember, th.BasicTeam.Name)
+		assertResolved(t, mentions, publicMember, th.BasicTeam.Name)
+		assert.NotContains(t, mentions, privateNonMember.Name)
+	})
 }
 
 func TestImageProxy(t *testing.T) {
@@ -740,44 +896,10 @@ func TestImageProxy(t *testing.T) {
 
 	for name, tc := range map[string]struct {
 		ProxyType              string
-		ProxyURL               string
-		ProxyOptions           string
 		ImageURL               string
 		ProxiedImageURL        string
 		ProxiedRemovedImageURL string
 	}{
-		"atmos/camo": {
-			ProxyType:              model.ImageProxyTypeAtmosCamo,
-			ProxyURL:               "https://127.0.0.1",
-			ProxyOptions:           "foo",
-			ImageURL:               "http://mydomain.com/myimage",
-			ProxiedRemovedImageURL: "http://mydomain.com/myimage",
-			ProxiedImageURL:        "http://mymattermost.com/api/v4/image?url=http%3A%2F%2Fmydomain.com%2Fmyimage",
-		},
-		"atmos/camo_SameSite": {
-			ProxyType:              model.ImageProxyTypeAtmosCamo,
-			ProxyURL:               "https://127.0.0.1",
-			ProxyOptions:           "foo",
-			ImageURL:               "http://mymattermost.com/myimage",
-			ProxiedRemovedImageURL: "http://mymattermost.com/myimage",
-			ProxiedImageURL:        "http://mymattermost.com/myimage",
-		},
-		"atmos/camo_PathOnly": {
-			ProxyType:              model.ImageProxyTypeAtmosCamo,
-			ProxyURL:               "https://127.0.0.1",
-			ProxyOptions:           "foo",
-			ImageURL:               "/myimage",
-			ProxiedRemovedImageURL: "http://mymattermost.com/myimage",
-			ProxiedImageURL:        "http://mymattermost.com/myimage",
-		},
-		"atmos/camo_EmptyImageURL": {
-			ProxyType:              model.ImageProxyTypeAtmosCamo,
-			ProxyURL:               "https://127.0.0.1",
-			ProxyOptions:           "foo",
-			ImageURL:               "",
-			ProxiedRemovedImageURL: "",
-			ProxiedImageURL:        "",
-		},
 		"local": {
 			ProxyType:              model.ImageProxyTypeLocal,
 			ImageURL:               "http://mydomain.com/myimage",
@@ -805,10 +927,8 @@ func TestImageProxy(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			th.App.UpdateConfig(func(cfg *model.Config) {
-				cfg.ImageProxySettings.Enable = model.NewPointer(true)
-				cfg.ImageProxySettings.ImageProxyType = model.NewPointer(tc.ProxyType)
-				cfg.ImageProxySettings.RemoteImageProxyOptions = model.NewPointer(tc.ProxyOptions)
-				cfg.ImageProxySettings.RemoteImageProxyURL = model.NewPointer(tc.ProxyURL)
+				cfg.ImageProxySettings.Enable = new(true)
+				cfg.ImageProxySettings.ImageProxyType = new(tc.ProxyType)
 			})
 
 			post := &model.Post{
@@ -949,8 +1069,56 @@ func TestDeletePostInArchivedChannel(t *testing.T) {
 	require.Equal(t, "api.post.delete_post.can_not_delete_post_in_deleted.error", err.Id)
 }
 
-func TestCreatePost(t *testing.T) {
+func TestDeletePostDeletesPersistentNotification(t *testing.T) {
 	mainHelper.Parallel(t)
+	th := Setup(t).InitBasic(t)
+
+	th.App.Srv().SetLicense(getLicWithSkuShortName(model.LicenseShortSkuProfessional))
+	th.App.UpdateConfig(func(cfg *model.Config) {
+		*cfg.ServiceSettings.PostPriority = true
+		*cfg.ServiceSettings.AllowPersistentNotifications = true
+	})
+
+	_, appErr := th.App.AddUserToChannel(th.Context, th.BasicUser2, th.BasicChannel, false)
+	require.Nil(t, appErr)
+
+	t.Run("should delete persistent notification for root post", func(t *testing.T) {
+		post := &model.Post{
+			UserId:    th.BasicUser.Id,
+			ChannelId: th.BasicChannel.Id,
+			Message:   "urgent " + "@" + th.BasicUser2.Username,
+			Metadata: &model.PostMetadata{
+				Priority: &model.PostPriority{
+					Priority:                model.NewPointer(model.PostPriorityUrgent),
+					PersistentNotifications: new(true),
+				},
+			},
+		}
+		post, _, appErr := th.App.CreatePost(th.Context, post, th.BasicChannel, model.CreatePostFlags{})
+		require.Nil(t, appErr)
+		require.Empty(t, post.RootId, "test post must be a root post")
+
+		// Verify persistent notification exists
+		pn, err := th.App.Srv().Store().PostPersistentNotification().GetSingle(post.Id)
+		require.NoError(t, err)
+		require.NotNil(t, pn)
+
+		// Delete the post (soft delete)
+		_, appErr = th.App.DeletePost(th.Context, post.Id, th.BasicUser.Id)
+		require.Nil(t, appErr)
+
+		// Verify persistent notification was deleted
+		_, err = th.App.Srv().Store().PostPersistentNotification().GetSingle(post.Id)
+		var nfErr *store.ErrNotFound
+		require.Error(t, err)
+		require.ErrorAs(t, err, &nfErr)
+	})
+}
+
+func TestCreatePost(t *testing.T) {
+	// This test is intentionally not parallel: two subtests below call t.Setenv
+	// to pin MM_FEATUREFLAGS_EnableSharedChannelsDMs, which Go disallows under a
+	// parallel ancestor.
 	t.Run("call PreparePostForClient before returning", func(t *testing.T) {
 		mainHelper.Parallel(t)
 		th := Setup(t).InitBasic(t)
@@ -958,9 +1126,7 @@ func TestCreatePost(t *testing.T) {
 		th.App.UpdateConfig(func(cfg *model.Config) {
 			*cfg.ServiceSettings.SiteURL = "http://mymattermost.com"
 			*cfg.ImageProxySettings.Enable = true
-			*cfg.ImageProxySettings.ImageProxyType = "atmos/camo"
-			*cfg.ImageProxySettings.RemoteImageProxyURL = "https://127.0.0.1"
-			*cfg.ImageProxySettings.RemoteImageProxyOptions = "foo"
+			*cfg.ImageProxySettings.ImageProxyType = "local"
 		})
 
 		th.App.ch.imageProxy = imageproxy.MakeImageProxy(th.Server.platform, th.Server.HTTPService(), th.Server.Log())
@@ -1170,7 +1336,10 @@ func TestCreatePost(t *testing.T) {
 	})
 
 	t.Run("Should not allow to create posts on shared DMs", func(t *testing.T) {
-		mainHelper.Parallel(t)
+		// The env override is reapplied on every config Set, so UpdateConfig cannot
+		// pin the flag; t.Setenv is the only safe way (and requires no parallel ancestor).
+		t.Setenv("MM_FEATUREFLAGS_EnableSharedChannelsDMs", "false")
+
 		th := setupSharedChannels(t).InitBasic(t)
 
 		user1 := th.CreateUser(t)
@@ -1194,7 +1363,7 @@ func TestCreatePost(t *testing.T) {
 		require.NoError(t, scErr)
 
 		// and we update the channel to mark it as shared
-		dm.Shared = model.NewPointer(true)
+		dm.Shared = new(true)
 		_, err := th.Server.Store().Channel().Update(th.Context, dm)
 		require.NoError(t, err)
 
@@ -1209,7 +1378,10 @@ func TestCreatePost(t *testing.T) {
 	})
 
 	t.Run("Should not allow to create posts on shared GMs", func(t *testing.T) {
-		mainHelper.Parallel(t)
+		// The env override is reapplied on every config Set, so UpdateConfig cannot
+		// pin the flag; t.Setenv is the only safe way (and requires no parallel ancestor).
+		t.Setenv("MM_FEATUREFLAGS_EnableSharedChannelsDMs", "false")
+
 		th := setupSharedChannels(t).InitBasic(t)
 
 		user1 := th.CreateUser(t)
@@ -1234,7 +1406,7 @@ func TestCreatePost(t *testing.T) {
 		require.NoError(t, err)
 
 		// and we update the channel to mark it as shared
-		gm.Shared = model.NewPointer(true)
+		gm.Shared = new(true)
 		_, err = th.Server.Store().Channel().Update(th.Context, gm)
 		require.NoError(t, err)
 
@@ -1332,12 +1504,402 @@ func TestCreatePost(t *testing.T) {
 		require.NotEmpty(t, createdPost.GetProp(model.PostPropsForceNotification))
 	})
 
-	t.Run("Should remove post file IDs for burn on read posts", func(t *testing.T) {
-		os.Setenv("MM_FEATUREFLAGS_BURNONREAD", "true")
-		t.Cleanup(func() {
-			os.Unsetenv("MM_FEATUREFLAGS_BURNONREAD")
-		})
+	t.Run("should reject silent notification from a human user", func(t *testing.T) {
+		mainHelper.Parallel(t)
 		th := Setup(t).InitBasic(t)
+
+		th.AddUserToChannel(t, th.BasicUser, th.BasicChannel)
+
+		postToCreate := &model.Post{
+			ChannelId: th.BasicChannel.Id,
+			Message:   "hello world",
+			UserId:    th.BasicUser.Id,
+		}
+		_, _, err := th.App.CreatePost(th.Context, postToCreate, th.BasicChannel, model.CreatePostFlags{SilentNotification: true})
+		require.NotNil(t, err)
+		require.Equal(t, "api.post.create_post.silent_notification.app_error", err.Id)
+		require.Equal(t, http.StatusForbidden, err.StatusCode)
+	})
+
+	t.Run("should preserve silent notification on non-SafeUpdate edit", func(t *testing.T) {
+		mainHelper.Parallel(t)
+		th := Setup(t).InitBasic(t)
+
+		bot := th.CreateBot(t)
+		botUser, appErr := th.App.GetUser(bot.UserId)
+		require.Nil(t, appErr)
+		th.LinkUserToTeam(t, botUser, th.BasicTeam)
+		_, appErr = th.App.AddUserToChannel(th.Context, botUser, th.BasicChannel, false)
+		require.Nil(t, appErr)
+
+		createdPost, _, err := th.App.CreatePost(th.Context, &model.Post{
+			ChannelId: th.BasicChannel.Id,
+			Message:   "silent before edit",
+			UserId:    bot.UserId,
+		}, th.BasicChannel, model.CreatePostFlags{SilentNotification: true})
+		require.Nil(t, err)
+		require.True(t, createdPost.HasSilentNotification())
+
+		createdPost.Message = "silent after edit"
+		createdPost.DelProp(model.PostPropsSilentNotification)
+		updatedPost, _, err := th.App.UpdatePost(th.Context, createdPost, nil)
+		require.Nil(t, err)
+		require.True(t, updatedPost.HasSilentNotification())
+	})
+
+	t.Run("should preserve from_webhook on non-SafeUpdate edit", func(t *testing.T) {
+		mainHelper.Parallel(t)
+		th := Setup(t).InitBasic(t)
+
+		createdPost, _, err := th.App.CreatePost(th.Context, &model.Post{
+			ChannelId: th.BasicChannel.Id,
+			Message:   "webhook before edit",
+			UserId:    th.BasicUser.Id,
+		}, th.BasicChannel, model.CreatePostFlags{SilentNotification: true, FromIncomingWebhook: true})
+		require.Nil(t, err)
+		require.Equal(t, "true", createdPost.GetProp(model.PostPropsFromWebhook))
+
+		createdPost.Message = "webhook after edit"
+		createdPost.DelProp(model.PostPropsFromWebhook)
+		updatedPost, _, err := th.App.UpdatePost(th.Context, createdPost, nil)
+		require.Nil(t, err)
+		require.Equal(t, "true", updatedPost.GetProp(model.PostPropsFromWebhook))
+	})
+
+	t.Run("should preserve from_bot on non-SafeUpdate edit", func(t *testing.T) {
+		mainHelper.Parallel(t)
+		th := Setup(t).InitBasic(t)
+
+		bot := th.CreateBot(t)
+		botUser, appErr := th.App.GetUser(bot.UserId)
+		require.Nil(t, appErr)
+		th.LinkUserToTeam(t, botUser, th.BasicTeam)
+		_, appErr = th.App.AddUserToChannel(th.Context, botUser, th.BasicChannel, false)
+		require.Nil(t, appErr)
+
+		createdPost, _, err := th.App.CreatePost(th.Context, &model.Post{
+			ChannelId: th.BasicChannel.Id,
+			Message:   "bot before edit",
+			UserId:    bot.UserId,
+		}, th.BasicChannel, model.CreatePostFlags{SilentNotification: true})
+		require.Nil(t, err)
+		require.Equal(t, "true", createdPost.GetProp(model.PostPropsFromBot))
+
+		createdPost.Message = "bot after edit"
+		createdPost.DelProp(model.PostPropsFromBot)
+		updatedPost, _, err := th.App.UpdatePost(th.Context, createdPost, nil)
+		require.Nil(t, err)
+		require.Equal(t, "true", updatedPost.GetProp(model.PostPropsFromBot))
+	})
+
+	t.Run("should not promote post to silent via edit payload", func(t *testing.T) {
+		mainHelper.Parallel(t)
+		th := Setup(t).InitBasic(t)
+
+		createdPost, _, err := th.App.CreatePost(th.Context, &model.Post{
+			ChannelId: th.BasicChannel.Id,
+			Message:   "normal post",
+			UserId:    th.BasicUser.Id,
+		}, th.BasicChannel, model.CreatePostFlags{})
+		require.Nil(t, err)
+		require.False(t, createdPost.HasSilentNotification())
+
+		createdPost.Message = "edited post"
+		createdPost.AddProp(model.PostPropsSilentNotification, true)
+		updatedPost, _, err := th.App.UpdatePost(th.Context, createdPost, nil)
+		require.Nil(t, err)
+		require.False(t, updatedPost.HasSilentNotification())
+	})
+
+	t.Run("should not preserve force notification on non-SafeUpdate edit", func(t *testing.T) {
+		mainHelper.Parallel(t)
+		th := Setup(t).InitBasic(t)
+
+		th.AddUserToChannel(t, th.BasicUser, th.BasicChannel)
+
+		createdPost, _, err := th.App.CreatePost(th.Context, &model.Post{
+			ChannelId: th.BasicChannel.Id,
+			Message:   "forced before edit",
+			UserId:    th.BasicUser.Id,
+		}, th.BasicChannel, model.CreatePostFlags{ForceNotification: true})
+		require.Nil(t, err)
+		require.True(t, createdPost.HasForceNotification())
+
+		createdPost.Message = "forced after edit"
+		createdPost.AddProp(model.PostPropsForceNotification, model.NewId())
+		updatedPost, _, err := th.App.UpdatePost(th.Context, createdPost, nil)
+		require.Nil(t, err)
+		require.False(t, updatedPost.HasForceNotification())
+	})
+
+	t.Run("should add silent notification prop for OAuth app posts", func(t *testing.T) {
+		mainHelper.Parallel(t)
+		th := Setup(t).InitBasic(t)
+
+		session := *th.Context.Session()
+		session.IsOAuth = true
+		oauthCtx := th.Context.WithSession(&session)
+
+		createdPost, _, err := th.App.CreatePost(oauthCtx, &model.Post{
+			ChannelId: th.BasicChannel.Id,
+			Message:   "oauth silent",
+			UserId:    th.BasicUser.Id,
+		}, th.BasicChannel, model.CreatePostFlags{SilentNotification: true})
+		require.Nil(t, err)
+		require.True(t, createdPost.HasSilentNotification())
+	})
+
+	t.Run("should add silent notification prop for incoming webhook flag", func(t *testing.T) {
+		mainHelper.Parallel(t)
+		th := Setup(t).InitBasic(t)
+
+		createdPost, _, err := th.App.CreatePost(th.Context, &model.Post{
+			ChannelId: th.BasicChannel.Id,
+			Message:   "webhook silent",
+			UserId:    th.BasicUser.Id,
+		}, th.BasicChannel, model.CreatePostFlags{SilentNotification: true, FromIncomingWebhook: true})
+		require.Nil(t, err)
+		require.True(t, createdPost.HasSilentNotification())
+		require.Equal(t, "true", createdPost.GetProp(model.PostPropsFromWebhook))
+	})
+
+	t.Run("should add silent notification prop for plugin posts", func(t *testing.T) {
+		mainHelper.Parallel(t)
+		th := Setup(t).InitBasic(t)
+
+		createdPost, _, err := th.App.CreatePost(th.Context, &model.Post{
+			ChannelId: th.BasicChannel.Id,
+			Message:   "plugin silent",
+			UserId:    th.BasicUser.Id,
+		}, th.BasicChannel, model.CreatePostFlags{SilentNotification: true, FromPlugin: true})
+		require.Nil(t, err)
+		require.True(t, createdPost.HasSilentNotification())
+		require.Equal(t, "true", createdPost.GetProp(model.PostPropsFromPlugin))
+	})
+
+	t.Run("should strip forged notification-policy props from human payload", func(t *testing.T) {
+		// silent_notification and force_notification are authorization-load-bearing
+		// (they change notification delivery for everyone in the channel) and must
+		// be stripped from non-integration callers regardless of hardened-mode
+		// setting. The from_* identity markers are not stripped by default in v11
+		// — they remain user-settable for backward compatibility. Hardened mode
+		// rejects from_webhook and from_plugin via ContainsIntegrationsReservedProps;
+		// from_bot and from_oauth_app are not currently in that reserved set.
+		mainHelper.Parallel(t)
+		th := Setup(t).InitBasic(t)
+
+		th.AddUserToChannel(t, th.BasicUser, th.BasicChannel)
+
+		createdPost, _, err := th.App.CreatePost(th.Context, &model.Post{
+			ChannelId: th.BasicChannel.Id,
+			Message:   "forged integration props",
+			UserId:    th.BasicUser.Id,
+			Props: model.StringInterface{
+				model.PostPropsSilentNotification: true,
+				model.PostPropsForceNotification:  "forged-id",
+			},
+		}, th.BasicChannel, model.CreatePostFlags{})
+		require.Nil(t, err)
+		require.Empty(t, createdPost.GetProp(model.PostPropsSilentNotification))
+		require.Empty(t, createdPost.GetProp(model.PostPropsForceNotification))
+	})
+
+	t.Run("force notification wins over silent", func(t *testing.T) {
+		mainHelper.Parallel(t)
+		th := Setup(t).InitBasic(t)
+
+		bot := th.CreateBot(t)
+		botUser, appErr := th.App.GetUser(bot.UserId)
+		require.Nil(t, appErr)
+		th.LinkUserToTeam(t, botUser, th.BasicTeam)
+		_, appErr = th.App.AddUserToChannel(th.Context, botUser, th.BasicChannel, false)
+		require.Nil(t, appErr)
+
+		createdPost, _, err := th.App.CreatePost(th.Context, &model.Post{
+			ChannelId: th.BasicChannel.Id,
+			Message:   "forced notify",
+			UserId:    bot.UserId,
+		}, th.BasicChannel, model.CreatePostFlags{SilentNotification: true, ForceNotification: true})
+		require.Nil(t, err)
+		require.True(t, createdPost.HasSilentNotification())
+		require.False(t, createdPost.IsNotificationSuppressed())
+	})
+
+	t.Run("should add silent notification prop for bot posts", func(t *testing.T) {
+		mainHelper.Parallel(t)
+		th := Setup(t).InitBasic(t)
+
+		bot := th.CreateBot(t)
+		botUser, appErr := th.App.GetUser(bot.UserId)
+		require.Nil(t, appErr)
+		th.LinkUserToTeam(t, botUser, th.BasicTeam)
+		_, appErr = th.App.AddUserToChannel(th.Context, botUser, th.BasicChannel, false)
+		require.Nil(t, appErr)
+
+		postToCreate := &model.Post{
+			ChannelId: th.BasicChannel.Id,
+			Message:   "silent status",
+			UserId:    bot.UserId,
+		}
+		createdPost, _, err := th.App.CreatePost(th.Context, postToCreate, th.BasicChannel, model.CreatePostFlags{SilentNotification: true})
+		require.Nil(t, err)
+		require.True(t, createdPost.HasSilentNotification())
+		require.True(t, createdPost.IsNotificationSuppressed())
+	})
+
+	t.Run("should reject silent notification with persistent notifications", func(t *testing.T) {
+		mainHelper.Parallel(t)
+		th := Setup(t).InitBasic(t)
+
+		th.App.UpdateConfig(func(cfg *model.Config) {
+			*cfg.ServiceSettings.PostPriority = true
+			*cfg.ServiceSettings.AllowPersistentNotifications = true
+		})
+
+		bot := th.CreateBot(t)
+		botUser, appErr := th.App.GetUser(bot.UserId)
+		require.Nil(t, appErr)
+		th.LinkUserToTeam(t, botUser, th.BasicTeam)
+		_, appErr = th.App.AddUserToChannel(th.Context, botUser, th.BasicChannel, false)
+		require.Nil(t, appErr)
+		_, appErr = th.App.AddUserToChannel(th.Context, th.BasicUser2, th.BasicChannel, false)
+		require.Nil(t, appErr)
+
+		_, _, err := th.App.CreatePost(th.Context, &model.Post{
+			ChannelId: th.BasicChannel.Id,
+			Message:   "silent persistent @" + th.BasicUser2.Username,
+			UserId:    bot.UserId,
+			Metadata: &model.PostMetadata{
+				Priority: &model.PostPriority{
+					Priority:                model.NewPointer(model.PostPriorityUrgent),
+					PersistentNotifications: model.NewPointer(true),
+				},
+			},
+		}, th.BasicChannel, model.CreatePostFlags{SilentNotification: true})
+		require.NotNil(t, err)
+		require.Equal(t, "api.post.create_post.silent_persistent_notification.app_error", err.Id)
+	})
+
+	t.Run("silent notification does not increase DM unread", func(t *testing.T) {
+		mainHelper.Parallel(t)
+		th := Setup(t).InitBasic(t)
+
+		bot := th.CreateBot(t)
+		botUser, appErr := th.App.GetUser(bot.UserId)
+		require.Nil(t, appErr)
+
+		dm, appErr := th.App.createDirectChannel(th.Context, botUser.Id, th.BasicUser2.Id)
+		require.Nil(t, appErr)
+
+		_, appErr = th.App.MarkChannelsAsViewed(th.Context, []string{dm.Id}, th.BasicUser2.Id, "", false, false)
+		require.Nil(t, appErr)
+
+		unreadBefore, appErr := th.App.GetChannelUnread(th.Context, dm.Id, th.BasicUser2.Id)
+		require.Nil(t, appErr)
+
+		_, _, appErr = th.App.CreatePost(th.Context, &model.Post{
+			ChannelId: dm.Id,
+			Message:   "silent dm",
+			UserId:    botUser.Id,
+		}, dm, model.CreatePostFlags{SilentNotification: true})
+		require.Nil(t, appErr)
+
+		unreadAfter, appErr := th.App.GetChannelUnread(th.Context, dm.Id, th.BasicUser2.Id)
+		require.Nil(t, appErr)
+		require.Equal(t, unreadBefore.MsgCount, unreadAfter.MsgCount)
+	})
+
+	t.Run("silent notification does not increase GM unread", func(t *testing.T) {
+		mainHelper.Parallel(t)
+		th := Setup(t).InitBasic(t)
+
+		bot := th.CreateBot(t)
+		botUser, appErr := th.App.GetUser(bot.UserId)
+		require.Nil(t, appErr)
+		_, _, appErr = th.App.AddUserToTeam(th.Context, th.BasicTeam.Id, botUser.Id, "")
+		require.Nil(t, appErr)
+
+		gm, appErr := th.App.createGroupChannel(th.Context, []string{th.BasicUser.Id, th.BasicUser2.Id, botUser.Id}, th.BasicUser.Id)
+		require.Nil(t, appErr)
+
+		_, appErr = th.App.MarkChannelsAsViewed(th.Context, []string{gm.Id}, th.BasicUser2.Id, "", false, false)
+		require.Nil(t, appErr)
+
+		unreadBefore, appErr := th.App.GetChannelUnread(th.Context, gm.Id, th.BasicUser2.Id)
+		require.Nil(t, appErr)
+
+		_, _, appErr = th.App.CreatePost(th.Context, &model.Post{
+			ChannelId: gm.Id,
+			Message:   "silent gm",
+			UserId:    botUser.Id,
+		}, gm, model.CreatePostFlags{SilentNotification: true})
+		require.Nil(t, appErr)
+
+		unreadAfter, appErr := th.App.GetChannelUnread(th.Context, gm.Id, th.BasicUser2.Id)
+		require.Nil(t, appErr)
+		require.Equal(t, unreadBefore.MsgCount, unreadAfter.MsgCount)
+	})
+
+	t.Run("silent notification does not increase channel unread", func(t *testing.T) {
+		mainHelper.Parallel(t)
+		th := Setup(t).InitBasic(t)
+
+		th.AddUserToChannel(t, th.BasicUser2, th.BasicChannel)
+		bot := th.CreateBot(t)
+		botUser, appErr := th.App.GetUser(bot.UserId)
+		require.Nil(t, appErr)
+		th.LinkUserToTeam(t, botUser, th.BasicTeam)
+		_, appErr = th.App.AddUserToChannel(th.Context, botUser, th.BasicChannel, false)
+		require.Nil(t, appErr)
+
+		_, _, appErr = th.App.CreatePost(th.Context, &model.Post{
+			ChannelId: th.BasicChannel.Id,
+			Message:   "baseline",
+			UserId:    th.BasicUser.Id,
+		}, th.BasicChannel, model.CreatePostFlags{})
+		require.Nil(t, appErr)
+
+		_, appErr = th.App.MarkChannelsAsViewed(th.Context, []string{th.BasicChannel.Id}, th.BasicUser2.Id, "", false, false)
+		require.Nil(t, appErr)
+
+		unreadBefore, appErr := th.App.GetChannelUnread(th.Context, th.BasicChannel.Id, th.BasicUser2.Id)
+		require.Nil(t, appErr)
+
+		_, _, appErr = th.App.CreatePost(th.Context, &model.Post{
+			ChannelId: th.BasicChannel.Id,
+			Message:   "silent update",
+			UserId:    bot.UserId,
+		}, th.BasicChannel, model.CreatePostFlags{SilentNotification: true})
+		require.Nil(t, appErr)
+
+		unreadAfter, appErr := th.App.GetChannelUnread(th.Context, th.BasicChannel.Id, th.BasicUser2.Id)
+		require.Nil(t, appErr)
+		require.Equal(t, unreadBefore.MsgCount, unreadAfter.MsgCount)
+	})
+
+	t.Run("creates post with type card", func(t *testing.T) {
+		mainHelper.Parallel(t)
+		th := Setup(t).InitBasic(t)
+
+		post := &model.Post{
+			ChannelId: th.BasicChannel.Id,
+			UserId:    th.BasicUser.Id,
+			Message:   "card post",
+			Type:      model.PostTypeCard,
+		}
+
+		rpost, _, appErr := th.App.CreatePost(th.Context, post, th.BasicChannel, model.CreatePostFlags{})
+		require.Nil(t, appErr)
+		require.NotNil(t, rpost)
+		assert.Equal(t, model.PostTypeCard, rpost.Type)
+		assert.Equal(t, "card post", rpost.Message)
+	})
+
+	t.Run("Should remove post file IDs for burn on read posts", func(t *testing.T) {
+		th := Setup(t).InitBasic(t)
+
+		// Enable BurnOnRead feature flag
+		th.App.UpdateConfig(func(cfg *model.Config) { cfg.FeatureFlags.BurnOnRead = true })
 		enableBoRFeature(th)
 
 		post := &model.Post{
@@ -1352,6 +1914,70 @@ func TestCreatePost(t *testing.T) {
 		require.Nil(t, appErr)
 		require.Empty(t, createdPost.FileIds)
 	})
+
+	t.Run("should reject burn-on-read posts in shared channels", func(t *testing.T) {
+		os.Setenv("MM_FEATUREFLAGS_BURNONREAD", "true")
+		t.Cleanup(func() {
+			os.Unsetenv("MM_FEATUREFLAGS_BURNONREAD")
+		})
+		th := setupSharedChannels(t).InitBasic(t)
+		enableBoRFeature(th)
+
+		channel := th.CreateChannel(t, th.BasicTeam)
+
+		sc := &model.SharedChannel{
+			ChannelId: channel.Id,
+			TeamId:    th.BasicTeam.Id,
+			Type:      channel.Type,
+			Home:      true,
+			ShareName: "shared-bor-test",
+			CreatorId: th.BasicUser.Id,
+			RemoteId:  model.NewId(),
+		}
+		_, scErr := th.Server.Store().SharedChannel().Save(sc)
+		require.NoError(t, scErr)
+
+		channel.Shared = new(true)
+		_, err := th.Server.Store().Channel().Update(th.Context, channel)
+		require.NoError(t, err)
+
+		post := &model.Post{
+			ChannelId: channel.Id,
+			UserId:    th.BasicUser.Id,
+			Message:   "burn-on-read in shared channel",
+			Type:      model.PostTypeBurnOnRead,
+		}
+
+		createdPost, _, appErr := th.App.CreatePost(th.Context, post, channel, model.CreatePostFlags{SetOnline: true})
+		require.NotNil(t, appErr)
+		require.Nil(t, createdPost)
+		require.Equal(t, "api.post.fill_in_post_props.burn_on_read.shared_channel.app_error", appErr.Id)
+		require.Equal(t, http.StatusBadRequest, appErr.StatusCode)
+	})
+
+	t.Run("should allow burn-on-read posts in non-shared channels", func(t *testing.T) {
+		os.Setenv("MM_FEATUREFLAGS_BURNONREAD", "true")
+		t.Cleanup(func() {
+			os.Unsetenv("MM_FEATUREFLAGS_BURNONREAD")
+		})
+		th := Setup(t).InitBasic(t)
+		enableBoRFeature(th)
+
+		channel := th.CreateChannel(t, th.BasicTeam)
+		require.False(t, channel.IsShared())
+
+		post := &model.Post{
+			ChannelId: channel.Id,
+			UserId:    th.BasicUser.Id,
+			Message:   "burn-on-read in non-shared channel",
+			Type:      model.PostTypeBurnOnRead,
+		}
+
+		createdPost, _, appErr := th.App.CreatePost(th.Context, post, channel, model.CreatePostFlags{SetOnline: true})
+		require.Nil(t, appErr)
+		require.NotNil(t, createdPost)
+		require.Equal(t, model.PostTypeBurnOnRead, createdPost.Type)
+	})
 }
 
 func TestPatchPost(t *testing.T) {
@@ -1363,9 +1989,7 @@ func TestPatchPost(t *testing.T) {
 		th.App.UpdateConfig(func(cfg *model.Config) {
 			*cfg.ServiceSettings.SiteURL = "http://mymattermost.com"
 			*cfg.ImageProxySettings.Enable = true
-			*cfg.ImageProxySettings.ImageProxyType = "atmos/camo"
-			*cfg.ImageProxySettings.RemoteImageProxyURL = "https://127.0.0.1"
-			*cfg.ImageProxySettings.RemoteImageProxyOptions = "foo"
+			*cfg.ImageProxySettings.ImageProxyType = "local"
 		})
 
 		th.App.ch.imageProxy = imageproxy.MakeImageProxy(th.Server.platform, th.Server.HTTPService(), th.Server.Log())
@@ -1384,7 +2008,7 @@ func TestPatchPost(t *testing.T) {
 		assert.NotEqual(t, "![image]("+proxiedImageURL+")", rpost.Message)
 
 		patch := &model.PostPatch{
-			Message: model.NewPointer("![image](" + imageURL + ")"),
+			Message: new("![image](" + imageURL + ")"),
 		}
 
 		rpost, _, err = th.App.PatchPost(th.Context, rpost.Id, patch, nil)
@@ -1408,13 +2032,13 @@ func TestPatchPost(t *testing.T) {
 		require.Nil(t, err)
 
 		t.Run("Does not set prop when user has USE_CHANNEL_MENTIONS", func(t *testing.T) {
-			patchWithNoMention := &model.PostPatch{Message: model.NewPointer("This patch has no channel mention")}
+			patchWithNoMention := &model.PostPatch{Message: new("This patch has no channel mention")}
 
 			rpost, _, err = th.App.PatchPost(th.Context, rpost.Id, patchWithNoMention, nil)
 			require.Nil(t, err)
 			assert.Equal(t, rpost.GetProps(), model.StringInterface{})
 
-			patchWithMention := &model.PostPatch{Message: model.NewPointer("This patch has a mention now @here")}
+			patchWithMention := &model.PostPatch{Message: new("This patch has a mention now @here")}
 
 			rpost, _, err = th.App.PatchPost(th.Context, rpost.Id, patchWithMention, nil)
 			require.Nil(t, err)
@@ -1425,12 +2049,12 @@ func TestPatchPost(t *testing.T) {
 			th.RemovePermissionFromRole(t, model.PermissionUseChannelMentions.Id, model.ChannelUserRoleId)
 			th.RemovePermissionFromRole(t, model.PermissionUseChannelMentions.Id, model.ChannelAdminRoleId)
 
-			patchWithNoMention := &model.PostPatch{Message: model.NewPointer("This patch still does not have a mention")}
+			patchWithNoMention := &model.PostPatch{Message: new("This patch still does not have a mention")}
 			rpost, _, err = th.App.PatchPost(th.Context, rpost.Id, patchWithNoMention, nil)
 			require.Nil(t, err)
 			assert.Equal(t, rpost.GetProps(), model.StringInterface{})
 
-			patchWithMention := &model.PostPatch{Message: model.NewPointer("This patch has a mention now @here")}
+			patchWithMention := &model.PostPatch{Message: new("This patch has a mention now @here")}
 
 			rpost, _, err = th.App.PatchPost(th.Context, rpost.Id, patchWithMention, nil)
 			require.Nil(t, err)
@@ -1483,7 +2107,7 @@ func TestPatchPost(t *testing.T) {
 
 		// Try to patch the post
 		patch := &model.PostPatch{
-			Message: model.NewPointer("updated message"),
+			Message: new("updated message"),
 		}
 		_, _, appErr := th.App.PatchPost(th.Context, post.Id, patch, model.DefaultUpdatePostOptions())
 		require.NotNil(t, appErr)
@@ -1531,14 +2155,20 @@ func TestCreatePostAsUser(t *testing.T) {
 			Message:   "test",
 			UserId:    th.BasicUser.Id,
 		}
-		post.AddProp(model.PostPropsFromWebhook, "true")
 
 		channelMemberBefore, err := th.App.Srv().Store().Channel().GetMember(th.Context, th.BasicChannel.Id, th.BasicUser.Id)
 		require.NoError(t, err)
 
 		time.Sleep(1 * time.Millisecond)
-		_, _, appErr := th.App.CreatePostAsUser(th.Context, post, "", true)
+		// from_webhook is now server-set via FromIncomingWebhook flag, not client-supplied Props.
+		// Route through CreatePostAsUserWithFlags so the "skip view-marking for webhook" branch
+		// (post.go) is actually exercised — CreatePost alone never touches LastViewedAt.
+		createdPost, _, appErr := th.App.CreatePostAsUserWithFlags(th.Context, post, "", model.CreatePostFlags{
+			SetOnline:           true,
+			FromIncomingWebhook: true,
+		})
 		require.Nil(t, appErr)
+		require.Equal(t, "true", createdPost.GetProp(model.PostPropsFromWebhook))
 
 		channelMemberAfter, err := th.App.Srv().Store().Channel().GetMember(th.Context, th.BasicChannel.Id, th.BasicUser.Id)
 		require.NoError(t, err)
@@ -1731,7 +2361,7 @@ func TestPatchPostInArchivedChannel(t *testing.T) {
 	appErr := th.App.DeleteChannel(th.Context, archivedChannel, "")
 	require.Nil(t, appErr)
 
-	_, _, err := th.App.PatchPost(th.Context, post.Id, &model.PostPatch{IsPinned: model.NewPointer(true)}, nil)
+	_, _, err := th.App.PatchPost(th.Context, post.Id, &model.PostPatch{IsPinned: new(true)}, nil)
 	require.NotNil(t, err)
 	require.Equal(t, "api.post.patch_post.can_not_update_post_in_deleted.error", err.Id)
 }
@@ -1818,9 +2448,7 @@ func TestUpdatePost(t *testing.T) {
 		th.App.UpdateConfig(func(cfg *model.Config) {
 			*cfg.ServiceSettings.SiteURL = "http://mymattermost.com"
 			*cfg.ImageProxySettings.Enable = true
-			*cfg.ImageProxySettings.ImageProxyType = "atmos/camo"
-			*cfg.ImageProxySettings.RemoteImageProxyURL = "https://127.0.0.1"
-			*cfg.ImageProxySettings.RemoteImageProxyOptions = "foo"
+			*cfg.ImageProxySettings.ImageProxyType = "local"
 		})
 
 		th.App.ch.imageProxy = imageproxy.MakeImageProxy(th.Server.platform, th.Server.HTTPService(), th.Server.Log())
@@ -2149,6 +2777,7 @@ func TestSearchPostsForUser(t *testing.T) {
 		es.On("SearchPosts", mock.Anything, mock.Anything, page, perPage).Return(resultsPage, nil, nil)
 		es.On("Start").Return(nil).Maybe()
 		es.On("IsActive").Return(true)
+		es.On("IsHealthy").Return(true)
 		es.On("IsSearchEnabled").Return(true)
 		th.App.Srv().Platform().SearchEngine.ElasticsearchEngine = es
 		defer func() {
@@ -2177,6 +2806,7 @@ func TestSearchPostsForUser(t *testing.T) {
 		es.On("SearchPosts", mock.Anything, mock.Anything, page, perPage).Return(resultsPage, nil, nil)
 		es.On("Start").Return(nil).Maybe()
 		es.On("IsActive").Return(true)
+		es.On("IsHealthy").Return(true)
 		es.On("IsSearchEnabled").Return(true)
 		th.App.Srv().Platform().SearchEngine.ElasticsearchEngine = es
 		defer func() {
@@ -2202,6 +2832,7 @@ func TestSearchPostsForUser(t *testing.T) {
 		es.On("GetName").Return("mock")
 		es.On("Start").Return(nil).Maybe()
 		es.On("IsActive").Return(true)
+		es.On("IsHealthy").Return(true)
 		es.On("IsSearchEnabled").Return(true)
 		th.App.Srv().Platform().SearchEngine.ElasticsearchEngine = es
 		defer func() {
@@ -2235,6 +2866,7 @@ func TestSearchPostsForUser(t *testing.T) {
 		es.On("GetName").Return("mock")
 		es.On("Start").Return(nil).Maybe()
 		es.On("IsActive").Return(true)
+		es.On("IsHealthy").Return(true)
 		es.On("IsSearchEnabled").Return(true)
 		th.App.Srv().Platform().SearchEngine.ElasticsearchEngine = es
 		defer func() {
@@ -2923,14 +3555,12 @@ func TestCountMentionsFromPost(t *testing.T) {
 			Message:   fmt.Sprintf("@%s", user2.Username),
 		}, channel, model.CreatePostFlags{SetOnline: true})
 		require.Nil(t, err)
+		// from_webhook is now server-set via FromIncomingWebhook flag, not client-supplied Props.
 		_, _, err = th.App.CreatePost(th.Context, &model.Post{
 			UserId:    user2.Id,
 			ChannelId: channel.Id,
 			Message:   fmt.Sprintf("@%s", user2.Username),
-			Props: map[string]any{
-				model.PostPropsFromWebhook: "true",
-			},
-		}, channel, model.CreatePostFlags{SetOnline: true})
+		}, channel, model.CreatePostFlags{SetOnline: true, FromIncomingWebhook: true})
 		require.Nil(t, err)
 
 		// post3 should mention the user
@@ -3067,7 +3697,7 @@ func TestFillInPostProps(t *testing.T) {
 			Email:         "success+" + id + "@simulator.amazonses.com",
 			Username:      "un_" + id,
 			Nickname:      "nn_" + id,
-			Password:      "Password1",
+			Password:      model.NewTestPassword(),
 			EmailVerified: true,
 		}
 		guest, err := th.App.CreateGuest(th.Context, guest)
@@ -3101,7 +3731,7 @@ func TestFillInPostProps(t *testing.T) {
 			Email:         "success+" + id + "@simulator.amazonses.com",
 			Username:      "un_" + id,
 			Nickname:      "nn_" + id,
-			Password:      "Password1",
+			Password:      model.NewTestPassword(),
 			EmailVerified: true,
 		}
 		guest, err := th.App.CreateGuest(th.Context, guest)
@@ -3243,6 +3873,8 @@ func TestFillInPostProps(t *testing.T) {
 
 		dmChannelBetweenUser1AndUser2 := th.CreateDmChannel(t, user2)
 
+		th.Context.Session().UserId = user1.Id
+
 		post, _, err := th.App.CreatePost(th.Context, &model.Post{
 			UserId:    user1.Id,
 			ChannelId: dmChannelBetweenUser1AndUser2.Id,
@@ -3267,6 +3899,8 @@ func TestFillInPostProps(t *testing.T) {
 		channel := th.CreateChannel(t, th.BasicTeam)
 
 		dmChannel := th.CreateDmChannel(t, user2)
+
+		th.Context.Session().UserId = user1.Id
 
 		post, _, err := th.App.CreatePost(th.Context, &model.Post{
 			UserId:    user1.Id,
@@ -3549,12 +4183,10 @@ func TestCollapsedThreadFetch(t *testing.T) {
 
 		// we introduce a race to trigger an unexpected error from the db side.
 		var wg sync.WaitGroup
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			err := th.Server.Store().Post().PermanentDeleteByUser(th.Context, user1.Id)
 			require.NoError(t, err)
-		}()
+		})
 
 		require.NotPanics(t, func() {
 			// We're only testing that this doesn't panic, not checking the error
@@ -3576,7 +4208,7 @@ func TestCollapsedThreadFetch(t *testing.T) {
 			Email:         "success+" + id + "@simulator.amazonses.com",
 			Username:      "un_" + id,
 			Nickname:      "nn_" + id,
-			AuthData:      model.NewPointer("bobbytables"),
+			AuthData:      new("bobbytables"),
 			AuthService:   "saml",
 			EmailVerified: true,
 		})
@@ -3839,6 +4471,213 @@ func TestGetPostIfAuthorized(t *testing.T) {
 	})
 }
 
+// MM-68140: thread context for rewrite must not be built from posts in channels the session cannot read.
+func TestBuildThreadContextForRewriteRequiresChannelReadAccess(t *testing.T) {
+	mainHelper.Parallel(t)
+	th := Setup(t).InitBasic(t)
+
+	t.Run("direct message between other users", func(t *testing.T) {
+		secretToken := "MM68140_SECRET_DM_THREAD_" + model.NewId()
+		dm := th.CreateDmChannel(t, th.BasicUser2)
+		root, _, err := th.App.CreatePost(th.Context, &model.Post{
+			UserId:    th.BasicUser.Id,
+			ChannelId: dm.Id,
+			Message:   secretToken,
+		}, dm, model.CreatePostFlags{})
+		require.Nil(t, err)
+
+		_, _, err = th.App.CreatePost(th.Context, &model.Post{
+			RootId:    root.Id,
+			UserId:    th.BasicUser2.Id,
+			ChannelId: dm.Id,
+			Message:   "reply only visible to DM participants",
+		}, dm, model.CreatePostFlags{})
+		require.Nil(t, err)
+
+		attacker := th.CreateUser(t)
+		session, err := th.App.CreateSession(th.Context, &model.Session{UserId: attacker.Id, Props: model.StringMap{}})
+		require.Nil(t, err)
+		ctx := th.Context.WithSession(session)
+
+		contextStr, appErr := th.App.buildThreadContextForRewrite(ctx, root.Id)
+
+		require.NotNil(t, appErr, "expected permission error when root_id is in a channel the user cannot read, got nil")
+		assert.Equal(t, http.StatusForbidden, appErr.StatusCode)
+		assert.NotContains(t, contextStr, secretToken)
+	})
+
+	t.Run("private channel the user is not a member of", func(t *testing.T) {
+		secretToken := "MM68140_SECRET_PRIVATE_THREAD_" + model.NewId()
+		privateCh := th.CreatePrivateChannel(t, th.BasicTeam)
+		root, _, err := th.App.CreatePost(th.Context, &model.Post{
+			UserId:    th.BasicUser.Id,
+			ChannelId: privateCh.Id,
+			Message:   secretToken,
+		}, privateCh, model.CreatePostFlags{})
+		require.Nil(t, err)
+
+		session, err := th.App.CreateSession(th.Context, &model.Session{UserId: th.BasicUser2.Id, Props: model.StringMap{}})
+		require.Nil(t, err)
+		ctx := th.Context.WithSession(session)
+
+		contextStr, appErr := th.App.buildThreadContextForRewrite(ctx, root.Id)
+
+		require.NotNil(t, appErr)
+		assert.Equal(t, http.StatusForbidden, appErr.StatusCode)
+		assert.NotContains(t, contextStr, secretToken)
+	})
+}
+
+// MM-68140: additional edge cases for thread context authorization and anchor resolution.
+func TestBuildThreadContextForRewriteEdgeCasesMM68140(t *testing.T) {
+	mainHelper.Parallel(t)
+	th := Setup(t).InitBasic(t)
+
+	t.Run("reply post id as root_id resolves thread and includes root message", func(t *testing.T) {
+		_, appErr := th.App.AddUserToChannel(th.Context, th.BasicUser2, th.BasicChannel, false)
+		require.Nil(t, appErr)
+
+		rootSecret := "MM68140_ROOT_VIA_REPLY_ANCHOR_" + model.NewId()
+		root, _, err := th.App.CreatePost(th.Context, &model.Post{
+			UserId:    th.BasicUser.Id,
+			ChannelId: th.BasicChannel.Id,
+			Message:   rootSecret,
+		}, th.BasicChannel, model.CreatePostFlags{})
+		require.Nil(t, err)
+
+		reply, _, err := th.App.CreatePost(th.Context, &model.Post{
+			RootId:    root.Id,
+			UserId:    th.BasicUser2.Id,
+			ChannelId: th.BasicChannel.Id,
+			Message:   "reply anchor",
+		}, th.BasicChannel, model.CreatePostFlags{})
+		require.Nil(t, err)
+
+		session, err := th.App.CreateSession(th.Context, &model.Session{UserId: th.BasicUser2.Id, Props: model.StringMap{}})
+		require.Nil(t, err)
+		ctx := th.Context.WithSession(session)
+
+		contextStr, appErr := th.App.buildThreadContextForRewrite(ctx, reply.Id)
+		require.Nil(t, appErr)
+		assert.Contains(t, contextStr, rootSecret)
+		assert.Contains(t, contextStr, "reply anchor")
+	})
+
+	t.Run("nonexistent post id returns not found", func(t *testing.T) {
+		session, err := th.App.CreateSession(th.Context, &model.Session{UserId: th.BasicUser.Id, Props: model.StringMap{}})
+		require.Nil(t, err)
+		ctx := th.Context.WithSession(session)
+
+		_, appErr := th.App.buildThreadContextForRewrite(ctx, model.NewId())
+		require.NotNil(t, appErr)
+		assert.Equal(t, http.StatusNotFound, appErr.StatusCode)
+	})
+
+	t.Run("soft-deleted anchor post returns not found", func(t *testing.T) {
+		root, _, err := th.App.CreatePost(th.Context, &model.Post{
+			UserId:    th.BasicUser.Id,
+			ChannelId: th.BasicChannel.Id,
+			Message:   "to be deleted",
+		}, th.BasicChannel, model.CreatePostFlags{})
+		require.Nil(t, err)
+
+		_, err = th.App.DeletePost(th.Context, root.Id, th.BasicUser.Id)
+		require.Nil(t, err)
+
+		session, err := th.App.CreateSession(th.Context, &model.Session{UserId: th.BasicUser.Id, Props: model.StringMap{}})
+		require.Nil(t, err)
+		ctx := th.Context.WithSession(session)
+
+		_, appErr := th.App.buildThreadContextForRewrite(ctx, root.Id)
+		require.NotNil(t, appErr)
+		assert.Equal(t, http.StatusNotFound, appErr.StatusCode)
+	})
+
+	t.Run("guest on team cannot use root_id for private channel they are not in", func(t *testing.T) {
+		th.App.UpdateConfig(func(cfg *model.Config) {
+			*cfg.GuestAccountsSettings.Enable = true
+		})
+
+		guest := th.CreateGuest(t)
+		_, _, appErr := th.App.AddUserToTeam(th.Context, th.BasicTeam.Id, guest.Id, "")
+		require.Nil(t, appErr)
+
+		privateCh := th.CreatePrivateChannel(t, th.BasicTeam)
+		secretToken := "MM68140_GUEST_PRIVATE_" + model.NewId()
+		root, _, err := th.App.CreatePost(th.Context, &model.Post{
+			UserId:    th.BasicUser.Id,
+			ChannelId: privateCh.Id,
+			Message:   secretToken,
+		}, privateCh, model.CreatePostFlags{})
+		require.Nil(t, err)
+
+		session, err := th.App.CreateSession(th.Context, &model.Session{UserId: guest.Id, Props: model.StringMap{}})
+		require.Nil(t, err)
+		ctx := th.Context.WithSession(session)
+
+		contextStr, appErr := th.App.buildThreadContextForRewrite(ctx, root.Id)
+		require.NotNil(t, appErr)
+		assert.Equal(t, http.StatusForbidden, appErr.StatusCode)
+		assert.NotContains(t, contextStr, secretToken)
+	})
+
+	t.Run("system admin may read thread context for DM they do not participate in", func(t *testing.T) {
+		dm := th.CreateDmChannel(t, th.BasicUser2)
+		secretToken := "MM68140_ADMIN_DM_THREAD_" + model.NewId()
+		root, _, err := th.App.CreatePost(th.Context, &model.Post{
+			UserId:    th.BasicUser.Id,
+			ChannelId: dm.Id,
+			Message:   secretToken,
+		}, dm, model.CreatePostFlags{})
+		require.Nil(t, err)
+
+		_, _, err = th.App.CreatePost(th.Context, &model.Post{
+			RootId:    root.Id,
+			UserId:    th.BasicUser2.Id,
+			ChannelId: dm.Id,
+			Message:   "dm reply",
+		}, dm, model.CreatePostFlags{})
+		require.Nil(t, err)
+
+		session, err := th.App.CreateSession(th.Context, &model.Session{UserId: th.SystemAdminUser.Id, Props: model.StringMap{}})
+		require.Nil(t, err)
+		ctx := th.Context.WithSession(session)
+
+		contextStr, appErr := th.App.buildThreadContextForRewrite(ctx, root.Id)
+		require.Nil(t, appErr)
+		assert.Contains(t, contextStr, secretToken)
+	})
+
+	t.Run("member can build context after channel is archived", func(t *testing.T) {
+		ch := th.CreateChannel(t, th.BasicTeam)
+		root, _, err := th.App.CreatePost(th.Context, &model.Post{
+			UserId:    th.BasicUser.Id,
+			ChannelId: ch.Id,
+			Message:   "MM68140_ARCHIVED_ROOT",
+		}, ch, model.CreatePostFlags{})
+		require.Nil(t, err)
+
+		_, _, err = th.App.CreatePost(th.Context, &model.Post{
+			RootId:    root.Id,
+			UserId:    th.BasicUser.Id,
+			ChannelId: ch.Id,
+			Message:   "reply in archived",
+		}, ch, model.CreatePostFlags{})
+		require.Nil(t, err)
+
+		appErr := th.App.DeleteChannel(th.Context, ch, th.SystemAdminUser.Id)
+		require.Nil(t, appErr)
+
+		session, err := th.App.CreateSession(th.Context, &model.Session{UserId: th.BasicUser.Id, Props: model.StringMap{}})
+		require.Nil(t, err)
+		ctx := th.Context.WithSession(session)
+
+		contextStr, appErr := th.App.buildThreadContextForRewrite(ctx, root.Id)
+		require.Nil(t, appErr)
+		assert.Contains(t, contextStr, "MM68140_ARCHIVED_ROOT")
+	})
+}
+
 func TestShouldNotRefollowOnOthersReply(t *testing.T) {
 	mainHelper.Parallel(t)
 	th := Setup(t).InitBasic(t)
@@ -4015,14 +4854,14 @@ func TestGetEditHistoryForPost(t *testing.T) {
 
 	// update the post message
 	patch := &model.PostPatch{
-		Message: model.NewPointer("new message edited"),
+		Message: new("new message edited"),
 	}
 	_, _, err1 := th.App.PatchPost(th.Context, rpost.Id, patch, nil)
 	require.Nil(t, err1)
 
 	// update the post message again
 	patch = &model.PostPatch{
-		Message: model.NewPointer("new message edited again"),
+		Message: new("new message edited again"),
 	}
 
 	_, _, err2 := th.App.PatchPost(th.Context, rpost.Id, patch, nil)
@@ -4059,19 +4898,19 @@ func TestGetEditHistoryForPost(t *testing.T) {
 		require.Nil(t, err)
 
 		patch := &model.PostPatch{
-			Message: model.NewPointer("new message edited"),
+			Message: new("new message edited"),
 		}
 		_, _, appErr := th.App.PatchPost(th.Context, post.Id, patch, nil)
 		require.Nil(t, appErr)
 
 		patch = &model.PostPatch{
-			Message: model.NewPointer("new message edited 2"),
+			Message: new("new message edited 2"),
 		}
 		_, _, appErr = th.App.PatchPost(th.Context, post.Id, patch, nil)
 		require.Nil(t, appErr)
 
 		patch = &model.PostPatch{
-			Message: model.NewPointer("new message edited 3"),
+			Message: new("new message edited 3"),
 		}
 		_, _, appErr = th.App.PatchPost(th.Context, post.Id, patch, nil)
 		require.Nil(t, appErr)
@@ -4105,19 +4944,19 @@ func TestGetEditHistoryForPost(t *testing.T) {
 		require.Nil(t, appErr)
 
 		patch := &model.PostPatch{
-			Message: model.NewPointer("new message edited"),
+			Message: new("new message edited"),
 		}
 		_, _, appErr = th.App.PatchPost(th.Context, post.Id, patch, nil)
 		require.Nil(t, appErr)
 
 		patch = &model.PostPatch{
-			Message: model.NewPointer("new message edited 2"),
+			Message: new("new message edited 2"),
 		}
 		_, _, appErr = th.App.PatchPost(th.Context, post.Id, patch, nil)
 		require.Nil(t, appErr)
 
 		patch = &model.PostPatch{
-			Message: model.NewPointer("new message edited 3"),
+			Message: new("new message edited 3"),
 		}
 		_, _, appErr = th.App.PatchPost(th.Context, post.Id, patch, nil)
 		require.Nil(t, appErr)
@@ -4198,11 +5037,11 @@ func TestValidateMoveOrCopy(t *testing.T) {
 	th := Setup(t).InitBasic(t)
 
 	th.App.UpdateConfig(func(cfg *model.Config) {
-		cfg.WranglerSettings.MoveThreadFromPrivateChannelEnable = model.NewPointer(true)
-		cfg.WranglerSettings.MoveThreadFromDirectMessageChannelEnable = model.NewPointer(true)
-		cfg.WranglerSettings.MoveThreadFromGroupMessageChannelEnable = model.NewPointer(true)
-		cfg.WranglerSettings.MoveThreadToAnotherTeamEnable = model.NewPointer(true)
-		cfg.WranglerSettings.MoveThreadMaxCount = model.NewPointer(int64(100))
+		cfg.WranglerSettings.MoveThreadFromPrivateChannelEnable = new(true)
+		cfg.WranglerSettings.MoveThreadFromDirectMessageChannelEnable = new(true)
+		cfg.WranglerSettings.MoveThreadFromGroupMessageChannelEnable = new(true)
+		cfg.WranglerSettings.MoveThreadToAnotherTeamEnable = new(true)
+		cfg.WranglerSettings.MoveThreadMaxCount = new(int64(100))
 	})
 
 	t.Run("empty post list", func(t *testing.T) {
@@ -4221,7 +5060,7 @@ func TestValidateMoveOrCopy(t *testing.T) {
 		require.Nil(t, err)
 
 		th.App.UpdateConfig(func(cfg *model.Config) {
-			cfg.WranglerSettings.MoveThreadFromPrivateChannelEnable = model.NewPointer(false)
+			cfg.WranglerSettings.MoveThreadFromPrivateChannelEnable = new(false)
 		})
 
 		e := th.App.ValidateMoveOrCopy(th.Context, &model.WranglerPostList{Posts: []*model.Post{{ChannelId: privateChannel.Id}}}, privateChannel, th.BasicChannel, th.BasicUser)
@@ -4234,7 +5073,7 @@ func TestValidateMoveOrCopy(t *testing.T) {
 		require.Nil(t, err)
 		require.NotNil(t, directChannel)
 		th.App.UpdateConfig(func(cfg *model.Config) {
-			cfg.WranglerSettings.MoveThreadFromDirectMessageChannelEnable = model.NewPointer(false)
+			cfg.WranglerSettings.MoveThreadFromDirectMessageChannelEnable = new(false)
 		})
 
 		e := th.App.ValidateMoveOrCopy(th.Context, &model.WranglerPostList{Posts: []*model.Post{{ChannelId: directChannel.Id}}}, directChannel, th.BasicChannel, th.BasicUser)
@@ -4252,7 +5091,7 @@ func TestValidateMoveOrCopy(t *testing.T) {
 		require.Nil(t, err)
 
 		th.App.UpdateConfig(func(cfg *model.Config) {
-			cfg.WranglerSettings.MoveThreadFromGroupMessageChannelEnable = model.NewPointer(false)
+			cfg.WranglerSettings.MoveThreadFromGroupMessageChannelEnable = new(false)
 		})
 
 		e := th.App.ValidateMoveOrCopy(th.Context, &model.WranglerPostList{Posts: []*model.Post{{ChannelId: groupChannel.Id}}}, groupChannel, th.BasicChannel, th.BasicUser)
@@ -4281,7 +5120,7 @@ func TestValidateMoveOrCopy(t *testing.T) {
 		require.Nil(t, err)
 
 		th.App.UpdateConfig(func(cfg *model.Config) {
-			cfg.WranglerSettings.MoveThreadToAnotherTeamEnable = model.NewPointer(false)
+			cfg.WranglerSettings.MoveThreadToAnotherTeamEnable = new(false)
 		})
 
 		e := th.App.ValidateMoveOrCopy(th.Context, &model.WranglerPostList{Posts: []*model.Post{{ChannelId: th.BasicChannel.Id}}}, th.BasicChannel, targetChannel, th.BasicUser)
@@ -4318,13 +5157,11 @@ func TestValidateMoveOrCopy(t *testing.T) {
 }
 
 func TestPermanentDeletePost(t *testing.T) {
-	os.Setenv("MM_FEATUREFLAGS_BURNONREAD", "true")
-	t.Cleanup(func() {
-		os.Unsetenv("MM_FEATUREFLAGS_BURNONREAD")
-	})
-
 	mainHelper.Parallel(t)
 	th := Setup(t).InitBasic(t)
+
+	// Enable BurnOnRead feature flag
+	th.App.UpdateConfig(func(cfg *model.Config) { cfg.FeatureFlags.BurnOnRead = true })
 
 	t.Run("should permanently delete a post and its file attachment", func(t *testing.T) {
 		// Create a post with a file attachment.
@@ -4416,7 +5253,7 @@ func TestPermanentDeletePost(t *testing.T) {
 		// Enable feature with license
 		th.App.Srv().SetLicense(model.NewTestLicenseSKU(model.LicenseShortSkuEnterpriseAdvanced))
 		th.App.UpdateConfig(func(cfg *model.Config) {
-			cfg.ServiceSettings.EnableBurnOnRead = model.NewPointer(true)
+			cfg.ServiceSettings.EnableBurnOnRead = new(true)
 		})
 
 		// Create a burn-on-read post with a file attachment
@@ -4449,7 +5286,7 @@ func TestPermanentDeletePost(t *testing.T) {
 		assert.Empty(t, post.FileIds)
 
 		// Verify that TemporaryPost exists with original content
-		tmpPost, tmpErr := th.App.Srv().Store().TemporaryPost().Get(th.Context, post.Id)
+		tmpPost, tmpErr := th.App.Srv().Store().TemporaryPost().Get(th.Context, post.Id, true)
 		require.NoError(t, tmpErr)
 		require.NotNil(t, tmpPost)
 		assert.Equal(t, "burn on read message with file", tmpPost.Message)
@@ -4472,16 +5309,57 @@ func TestPermanentDeletePost(t *testing.T) {
 		assert.NotNil(t, err)
 
 		// Verify TemporaryPost is also deleted
-		_, tmpErr = th.App.Srv().Store().TemporaryPost().Get(th.Context, post.Id)
+		_, tmpErr = th.App.Srv().Store().TemporaryPost().Get(th.Context, post.Id, true)
 		assert.Error(t, tmpErr)
 		assert.True(t, store.IsErrNotFound(tmpErr))
+	})
+
+	t.Run("should delete persistent notification for root post", func(t *testing.T) {
+		th.App.Srv().SetLicense(getLicWithSkuShortName(model.LicenseShortSkuProfessional))
+		th.App.UpdateConfig(func(cfg *model.Config) {
+			*cfg.ServiceSettings.PostPriority = true
+			*cfg.ServiceSettings.AllowPersistentNotifications = true
+		})
+
+		_, appErr := th.App.AddUserToChannel(th.Context, th.BasicUser2, th.BasicChannel, false)
+		require.Nil(t, appErr)
+
+		post := &model.Post{
+			UserId:    th.BasicUser.Id,
+			ChannelId: th.BasicChannel.Id,
+			Message:   "urgent " + "@" + th.BasicUser2.Username,
+			Metadata: &model.PostMetadata{
+				Priority: &model.PostPriority{
+					Priority:                model.NewPointer(model.PostPriorityUrgent),
+					PersistentNotifications: new(true),
+				},
+			},
+		}
+		post, _, appErr = th.App.CreatePost(th.Context, post, th.BasicChannel, model.CreatePostFlags{})
+		require.Nil(t, appErr)
+		require.Empty(t, post.RootId, "test post must be a root post")
+
+		// Verify persistent notification exists
+		pn, err := th.App.Srv().Store().PostPersistentNotification().GetSingle(post.Id)
+		require.NoError(t, err)
+		require.NotNil(t, pn)
+
+		// Permanently delete the post
+		appErr = th.App.PermanentDeletePost(th.Context, post.Id, th.BasicUser.Id)
+		require.Nil(t, appErr)
+
+		// Verify persistent notification was deleted
+		_, err = th.App.Srv().Store().PostPersistentNotification().GetSingle(post.Id)
+		var nfErr *store.ErrNotFound
+		require.Error(t, err)
+		require.ErrorAs(t, err, &nfErr)
 	})
 
 	t.Run("should send unrevealed post in websocket broadcast", func(t *testing.T) {
 		// Enable feature with license
 		th.App.Srv().SetLicense(model.NewTestLicenseSKU(model.LicenseShortSkuEnterpriseAdvanced))
 		th.App.UpdateConfig(func(cfg *model.Config) {
-			cfg.ServiceSettings.EnableBurnOnRead = model.NewPointer(true)
+			cfg.ServiceSettings.EnableBurnOnRead = new(true)
 		})
 
 		// Create a burn-on-read post
@@ -4525,6 +5403,110 @@ func TestPermanentDeletePost(t *testing.T) {
 		case <-time.After(10 * time.Second):
 			require.Fail(t, "Did not receive websocket message in time")
 		}
+	})
+}
+
+func TestCleanUpAfterPostDeletion(t *testing.T) {
+	mainHelper.Parallel(t)
+	th := Setup(t).InitBasic(t)
+
+	appErr := th.App.JoinChannel(th.Context, th.BasicChannel, th.BasicUser.Id)
+	require.Nil(t, appErr)
+	appErr = th.App.JoinChannel(th.Context, th.BasicChannel, th.BasicUser2.Id)
+	require.Nil(t, appErr)
+
+	waitForPostDeleted := func(t *testing.T, messages chan *model.WebSocketEvent) *model.WebSocketEvent {
+		t.Helper()
+
+		select {
+		case received := <-messages:
+			return received
+		case <-time.After(10 * time.Second):
+			require.Fail(t, "Did not receive websocket message in time")
+			return nil
+		}
+	}
+
+	t.Run("post_deleted broadcast to channel members strips action integrations", func(t *testing.T) {
+		post, _, appErr := th.App.CreatePost(th.Context, &model.Post{
+			UserId:    th.BasicUser.Id,
+			ChannelId: th.BasicChannel.Id,
+			Message:   "interactive message",
+			Props: model.StringInterface{
+				model.PostPropsAttachments: []*model.MessageAttachment{
+					{
+						Text: "hello",
+						Actions: []*model.PostAction{
+							{
+								Type: model.PostActionTypeButton,
+								Name: "action",
+								Integration: &model.PostActionIntegration{
+									URL:     "http://localhost:8065/secret-endpoint",
+									Context: map[string]any{"secret_marker": "s3cr3t"},
+								},
+							},
+						},
+					},
+				},
+			},
+		}, th.BasicChannel, model.CreatePostFlags{})
+		require.Nil(t, appErr)
+
+		memberMessages, closeMemberWS := connectFakeWebSocket(t, th, th.BasicUser2.Id, "", []model.WebsocketEventType{model.WebsocketEventPostDeleted})
+		defer closeMemberWS()
+
+		_, appErr = th.App.DeletePost(th.Context, post.Id, th.BasicUser.Id)
+		require.Nil(t, appErr)
+
+		memberEvent := waitForPostDeleted(t, memberMessages)
+		memberPostJSON, ok := memberEvent.GetData()["post"].(string)
+		require.True(t, ok)
+		assert.NotContains(t, memberPostJSON, "secret-endpoint")
+		assert.NotContains(t, memberPostJSON, "secret_marker")
+		assert.Nil(t, memberEvent.GetData()["delete_by"])
+
+		var memberPost model.Post
+		require.NoError(t, json.Unmarshal([]byte(memberPostJSON), &memberPost))
+		require.Equal(t, post.Id, memberPost.Id)
+		memberAttachments := memberPost.Attachments()
+		require.Len(t, memberAttachments, 1)
+		require.Len(t, memberAttachments[0].Actions, 1)
+		assert.Equal(t, "action", memberAttachments[0].Actions[0].Name, "non-secret attachment data must be preserved")
+		assert.Nil(t, memberAttachments[0].Actions[0].Integration)
+	})
+
+	t.Run("post_deleted broadcast to channel members strips mm_blocks_actions secrets", func(t *testing.T) {
+		post, _, appErr := th.App.CreatePost(th.Context, &model.Post{
+			UserId:    th.BasicUser.Id,
+			ChannelId: th.BasicChannel.Id,
+			Message:   "blocks message",
+		}, th.BasicChannel, model.CreatePostFlags{})
+		require.Nil(t, appErr)
+
+		post.AddProp(model.PostPropsMmBlocksActions, map[string]any{
+			"mm_blocks_act": map[string]any{
+				"type":    model.MmBlocksActionTypeExternal,
+				"url":     "http://localhost:8065/secret-endpoint",
+				"context": map[string]any{"secret_marker": "s3cr3t"},
+			},
+		})
+
+		memberMessages, closeMemberWS := connectFakeWebSocket(t, th, th.BasicUser2.Id, "", []model.WebsocketEventType{model.WebsocketEventPostDeleted})
+		defer closeMemberWS()
+
+		appErr = th.App.CleanUpAfterPostDeletion(th.Context, post, th.BasicUser.Id)
+		require.Nil(t, appErr)
+
+		memberEvent := waitForPostDeleted(t, memberMessages)
+		memberPostJSON, ok := memberEvent.GetData()["post"].(string)
+		require.True(t, ok)
+		assert.NotContains(t, memberPostJSON, "secret-endpoint")
+		assert.NotContains(t, memberPostJSON, "secret_marker")
+
+		var memberPost model.Post
+		require.NoError(t, json.Unmarshal([]byte(memberPostJSON), &memberPost))
+		assert.Equal(t, post.Id, memberPost.Id)
+		assert.Nil(t, memberPost.GetProp(model.PostPropsMmBlocksActions))
 	})
 }
 
@@ -4797,12 +5779,10 @@ func TestFilterPostsByChannelPermissions(t *testing.T) {
 }
 
 func TestRevealPost(t *testing.T) {
-	os.Setenv("MM_FEATUREFLAGS_BURNONREAD", "true")
-	t.Cleanup(func() {
-		os.Unsetenv("MM_FEATUREFLAGS_BURNONREAD")
-	})
-
 	th := Setup(t).InitBasic(t)
+
+	// Enable BurnOnRead feature flag
+	th.App.UpdateConfig(func(cfg *model.Config) { cfg.FeatureFlags.BurnOnRead = true })
 
 	// Helper to create a burn-on-read post
 	createBurnOnReadPost := func() *model.Post {
@@ -5006,21 +5986,64 @@ func TestRevealPost(t *testing.T) {
 		require.NotZero(t, revealedPost.Metadata.ExpireAt)
 		require.Len(t, revealedPost.Metadata.Files, 1)
 	})
+
+	t.Run("updateTemporaryPostIfAllRead bypasses cache to get fresh data", func(t *testing.T) {
+		enableBoRFeature(th)
+
+		// Create a third user to have multiple recipients
+		user3 := th.CreateUser(t)
+		th.LinkUserToTeam(t, user3, th.BasicTeam)
+		th.AddUserToChannel(t, user3, th.BasicChannel)
+
+		post := createBurnOnReadPost()
+
+		// Get initial TemporaryPost ExpireAt (should be max TTL - 24 hours)
+		tmpPostInitial, err := th.App.Srv().Store().TemporaryPost().Get(th.Context, post.Id, true)
+		require.NoError(t, err)
+		initialExpireAt := tmpPostInitial.ExpireAt
+
+		// First reveal by user2 creates a read receipt
+		_, appErr := th.App.RevealPost(th.Context, post, user2.Id, "")
+		require.Nil(t, appErr)
+
+		// Get the read receipt's ExpireAt (should be 5 minutes)
+		receipt, err := th.App.Srv().Store().ReadReceipt().Get(th.Context, post.Id, user2.Id)
+		require.NoError(t, err)
+
+		// Verify receipt ExpireAt is less than initial tmpPost ExpireAt (5 minutes vs 24 hours)
+		require.Less(t, receipt.ExpireAt, initialExpireAt)
+
+		// At this point, user3 hasn't revealed yet, so TemporaryPost shouldn't be updated
+		tmpPostAfterFirstReveal, err := th.App.Srv().Store().TemporaryPost().Get(th.Context, post.Id, false)
+		require.NoError(t, err)
+		require.Equal(t, initialExpireAt, tmpPostAfterFirstReveal.ExpireAt)
+
+		// Now user3 reveals - this should trigger updateTemporaryPostIfAllRead
+		_, appErr = th.App.RevealPost(th.Context, post, user3.Id, "")
+		require.Nil(t, appErr)
+
+		// Fetch the TemporaryPost with cache bypass to verify it was updated
+		tmpPostAfterAllReveal, err := th.App.Srv().Store().TemporaryPost().Get(th.Context, post.Id, false)
+		require.NoError(t, err)
+
+		// Verify the ExpireAt was updated to match the shortest receipt ExpireAt
+		require.Less(t, tmpPostAfterAllReveal.ExpireAt, initialExpireAt)
+		// Should be close to the first recipient's ExpireAt (within a few ms due to timing)
+		require.InDelta(t, receipt.ExpireAt, tmpPostAfterAllReveal.ExpireAt, 10000) // 10 second tolerance
+	})
 }
 
 func TestBurnPost(t *testing.T) {
-	os.Setenv("MM_FEATUREFLAGS_BURNONREAD", "true")
-	t.Cleanup(func() {
-		os.Unsetenv("MM_FEATUREFLAGS_BURNONREAD")
-	})
-
 	th := Setup(t).InitBasic(t)
+
+	// Enable BurnOnRead feature flag
+	th.App.UpdateConfig(func(cfg *model.Config) { cfg.FeatureFlags.BurnOnRead = true })
 
 	// feature flag, configuration and license is not checked for this feature
 	// so we set these to enable the feature to create a burn on read post
 	th.App.Srv().SetLicense(model.NewTestLicenseSKU(model.LicenseShortSkuEnterpriseAdvanced))
 	th.App.UpdateConfig(func(cfg *model.Config) {
-		cfg.ServiceSettings.EnableBurnOnRead = model.NewPointer(true)
+		cfg.ServiceSettings.EnableBurnOnRead = new(true)
 	})
 
 	th.AddUserToChannel(t, th.BasicUser, th.BasicChannel)  // author of the post
@@ -5129,12 +6152,10 @@ func TestBurnPost(t *testing.T) {
 }
 
 func TestGetFlaggedPostsWithExpiredBurnOnRead(t *testing.T) {
-	os.Setenv("MM_FEATUREFLAGS_BURNONREAD", "true")
-	t.Cleanup(func() {
-		os.Unsetenv("MM_FEATUREFLAGS_BURNONREAD")
-	})
-
 	th := Setup(t).InitBasic(t)
+
+	// Enable BurnOnRead feature flag
+	th.App.UpdateConfig(func(cfg *model.Config) { cfg.FeatureFlags.BurnOnRead = true })
 
 	// Create a second user for testing
 	user2 := th.CreateUser(t)
@@ -5320,5 +6341,427 @@ func TestGetFlaggedPostsWithExpiredBurnOnRead(t *testing.T) {
 		require.NotNil(t, post.Metadata)
 		require.NotZero(t, post.Metadata.ExpireAt)
 		require.Greater(t, post.Metadata.ExpireAt, model.GetMillis())
+	})
+}
+
+func TestBurnOnReadRestrictionsForDMsAndBots(t *testing.T) {
+	th := Setup(t).InitBasic(t)
+
+	// Enable BurnOnRead feature flag
+	th.App.UpdateConfig(func(cfg *model.Config) { cfg.FeatureFlags.BurnOnRead = true })
+
+	th.App.Srv().SetLicense(model.NewTestLicenseSKU(model.LicenseShortSkuEnterpriseAdvanced))
+
+	th.App.UpdateConfig(func(cfg *model.Config) {
+		cfg.ServiceSettings.EnableBurnOnRead = new(true)
+		cfg.ServiceSettings.BurnOnReadMaximumTimeToLiveSeconds = new(600)
+		cfg.ServiceSettings.BurnOnReadDurationSeconds = new(600)
+	})
+
+	t.Run("should allow burn-on-read posts in direct messages with another user", func(t *testing.T) {
+		// Create a direct message channel between two different users
+		dmChannel, appErr := th.App.GetOrCreateDirectChannel(th.Context, th.BasicUser.Id, th.BasicUser2.Id)
+		require.Nil(t, appErr)
+		require.Equal(t, model.ChannelTypeDirect, dmChannel.Type)
+
+		post := &model.Post{
+			ChannelId: dmChannel.Id,
+			Message:   "This is a burn-on-read message in DM",
+			UserId:    th.BasicUser.Id,
+			Type:      model.PostTypeBurnOnRead,
+		}
+
+		createdPost, _, err := th.App.CreatePost(th.Context, post, dmChannel, model.CreatePostFlags{SetOnline: true})
+		require.Nil(t, err)
+		require.NotNil(t, createdPost)
+		require.Equal(t, model.PostTypeBurnOnRead, createdPost.Type)
+	})
+
+	t.Run("should allow burn-on-read posts in group messages", func(t *testing.T) {
+		// Create a group message channel with at least 3 users
+		user3 := th.CreateUser(t)
+		th.LinkUserToTeam(t, user3, th.BasicTeam)
+		gmChannel := th.CreateGroupChannel(t, th.BasicUser2, user3)
+		require.Equal(t, model.ChannelTypeGroup, gmChannel.Type)
+
+		// This should succeed - group messages allow BoR
+		post := &model.Post{
+			ChannelId: gmChannel.Id,
+			Message:   "This is a burn-on-read message in GM",
+			UserId:    th.BasicUser.Id,
+			Type:      model.PostTypeBurnOnRead,
+		}
+
+		createdPost, _, err := th.App.CreatePost(th.Context, post, gmChannel, model.CreatePostFlags{SetOnline: true})
+		require.Nil(t, err)
+		require.NotNil(t, createdPost)
+		require.Equal(t, model.PostTypeBurnOnRead, createdPost.Type)
+	})
+
+	t.Run("should allow burn-on-read posts from bot users", func(t *testing.T) {
+		// Create a bot user
+		bot := &model.Bot{
+			Username:    "testbot",
+			DisplayName: "Test Bot",
+			Description: "Test Bot for burn-on-read (bots can send BoR for OTP, integrations, etc.)",
+			OwnerId:     th.BasicUser.Id,
+		}
+		createdBot, appErr := th.App.CreateBot(th.Context, bot)
+		require.Nil(t, appErr)
+
+		// Get the bot user
+		botUser, appErr := th.App.GetUser(createdBot.UserId)
+		require.Nil(t, appErr)
+		require.True(t, botUser.IsBot)
+
+		// Create a burn-on-read post as bot (should succeed - bots can send BoR)
+		post := &model.Post{
+			ChannelId: th.BasicChannel.Id,
+			Message:   "This is a burn-on-read message from bot",
+			UserId:    botUser.Id,
+			Type:      model.PostTypeBurnOnRead,
+		}
+
+		createdPost, _, err := th.App.CreatePost(th.Context, post, th.BasicChannel, model.CreatePostFlags{SetOnline: true})
+		require.Nil(t, err)
+		require.NotNil(t, createdPost)
+		require.Equal(t, model.PostTypeBurnOnRead, createdPost.Type)
+	})
+
+	t.Run("should reject burn-on-read posts in self DMs", func(t *testing.T) {
+		// Create a self DM channel (user messaging themselves)
+		selfDMChannel, appErr := th.App.GetOrCreateDirectChannel(th.Context, th.BasicUser.Id, th.BasicUser.Id)
+		require.Nil(t, appErr)
+		require.Equal(t, model.ChannelTypeDirect, selfDMChannel.Type)
+
+		// Try to create a burn-on-read post in self DM
+		post := &model.Post{
+			ChannelId: selfDMChannel.Id,
+			Message:   "This is a burn-on-read message to myself",
+			UserId:    th.BasicUser.Id,
+			Type:      model.PostTypeBurnOnRead,
+		}
+
+		_, _, err := th.App.CreatePost(th.Context, post, selfDMChannel, model.CreatePostFlags{SetOnline: true})
+		require.NotNil(t, err)
+		require.Equal(t, "api.post.fill_in_post_props.burn_on_read.self_dm.app_error", err.Id)
+	})
+
+	t.Run("should reject burn-on-read posts in DMs with bots/AI agents", func(t *testing.T) {
+		// Create a bot user
+		bot := &model.Bot{
+			Username:    "aiagent",
+			DisplayName: "AI Agent",
+			Description: "Test AI Agent for burn-on-read restrictions",
+			OwnerId:     th.BasicUser.Id,
+		}
+		createdBot, appErr := th.App.CreateBot(th.Context, bot)
+		require.Nil(t, appErr)
+
+		// Get the bot user
+		botUser, appErr := th.App.GetUser(createdBot.UserId)
+		require.Nil(t, appErr)
+		require.True(t, botUser.IsBot)
+
+		// Create a DM channel between the regular user and the bot
+		dmWithBotChannel, appErr := th.App.GetOrCreateDirectChannel(th.Context, th.BasicUser.Id, botUser.Id)
+		require.Nil(t, appErr)
+		require.Equal(t, model.ChannelTypeDirect, dmWithBotChannel.Type)
+
+		// Try to create a burn-on-read post in DM with bot (regular user sending)
+		post := &model.Post{
+			ChannelId: dmWithBotChannel.Id,
+			Message:   "This is a burn-on-read message to AI agent",
+			UserId:    th.BasicUser.Id,
+			Type:      model.PostTypeBurnOnRead,
+		}
+
+		_, _, err := th.App.CreatePost(th.Context, post, dmWithBotChannel, model.CreatePostFlags{SetOnline: true})
+		require.NotNil(t, err)
+		require.Equal(t, "api.post.fill_in_post_props.burn_on_read.bot_dm.app_error", err.Id)
+	})
+
+	t.Run("should reject burn-on-read posts in DMs with deleted users", func(t *testing.T) {
+		// Create a user that we'll delete
+		userToDelete := th.CreateUser(t)
+		th.LinkUserToTeam(t, userToDelete, th.BasicTeam)
+
+		// Create a DM channel between the regular user and the user we'll delete
+		dmChannel, appErr := th.App.GetOrCreateDirectChannel(th.Context, th.BasicUser.Id, userToDelete.Id)
+		require.Nil(t, appErr)
+		require.Equal(t, model.ChannelTypeDirect, dmChannel.Type)
+
+		// Delete the user
+		appErr = th.App.PermanentDeleteUser(th.Context, userToDelete)
+		require.Nil(t, appErr)
+
+		// Try to create a burn-on-read post in DM with deleted user
+		post := &model.Post{
+			ChannelId: dmChannel.Id,
+			Message:   "This is a burn-on-read message to deleted user",
+			UserId:    th.BasicUser.Id,
+			Type:      model.PostTypeBurnOnRead,
+		}
+
+		// This should fail because we can't validate the other user (deleted)
+		_, _, err := th.App.CreatePost(th.Context, post, dmChannel, model.CreatePostFlags{SetOnline: true})
+		require.NotNil(t, err)
+		require.Equal(t, "api.post.fill_in_post_props.burn_on_read.user.app_error", err.Id)
+	})
+
+	t.Run("should allow burn-on-read posts in public channels", func(t *testing.T) {
+		// This should succeed - public channel, regular user
+		require.Equal(t, model.ChannelTypeOpen, th.BasicChannel.Type)
+
+		post := &model.Post{
+			ChannelId: th.BasicChannel.Id,
+			Message:   "This is a burn-on-read message in public channel",
+			UserId:    th.BasicUser.Id,
+			Type:      model.PostTypeBurnOnRead,
+		}
+
+		createdPost, _, err := th.App.CreatePost(th.Context, post, th.BasicChannel, model.CreatePostFlags{SetOnline: true})
+		require.Nil(t, err)
+		require.NotNil(t, createdPost)
+		require.Equal(t, model.PostTypeBurnOnRead, createdPost.Type)
+	})
+
+	t.Run("should allow burn-on-read posts in private channels", func(t *testing.T) {
+		// Create a private channel using helper
+		createdPrivateChannel := th.CreatePrivateChannel(t, th.BasicTeam)
+		require.Equal(t, model.ChannelTypePrivate, createdPrivateChannel.Type)
+
+		// This should succeed - private channel, regular user
+		post := &model.Post{
+			ChannelId: createdPrivateChannel.Id,
+			Message:   "This is a burn-on-read message in private channel",
+			UserId:    th.BasicUser.Id,
+			Type:      model.PostTypeBurnOnRead,
+		}
+
+		createdPost, _, err := th.App.CreatePost(th.Context, post, createdPrivateChannel, model.CreatePostFlags{SetOnline: true})
+		require.Nil(t, err)
+		require.NotNil(t, createdPost)
+		require.Equal(t, model.PostTypeBurnOnRead, createdPost.Type)
+	})
+}
+
+func TestGetBurnOnReadPost(t *testing.T) {
+	t.Run("success - temporary post found", func(t *testing.T) {
+		th := Setup(t).InitBasic(t)
+
+		post := &model.Post{
+			Id:        model.NewId(),
+			ChannelId: th.BasicChannel.Id,
+			UserId:    th.BasicUser.Id,
+			Message:   "placeholder message",
+			FileIds:   model.StringArray{"file1"},
+			Type:      model.PostTypeBurnOnRead,
+		}
+
+		temporaryPost := &model.TemporaryPost{
+			ID:       post.Id,
+			Type:     model.PostTypeBurnOnRead,
+			ExpireAt: model.GetMillis() + 3600000,
+			Message:  "actual secret message",
+			FileIDs:  model.StringArray{"file2", "file3"},
+		}
+
+		_, err := th.App.Srv().Store().TemporaryPost().Save(th.Context, temporaryPost)
+		require.NoError(t, err)
+
+		resultPost, appErr := th.App.getBurnOnReadPost(th.Context, post)
+
+		require.Nil(t, appErr)
+		require.NotNil(t, resultPost)
+		assert.Equal(t, temporaryPost.Message, resultPost.Message)
+		assert.Equal(t, temporaryPost.FileIDs, resultPost.FileIds)
+		// Ensure original post is not modified
+		assert.Equal(t, "placeholder message", post.Message)
+		assert.Equal(t, model.StringArray{"file1"}, post.FileIds)
+	})
+
+	t.Run("temporary post not found - returns app error", func(t *testing.T) {
+		th := Setup(t).InitBasic(t)
+
+		post := &model.Post{
+			Id:        model.NewId(),
+			ChannelId: th.BasicChannel.Id,
+			UserId:    th.BasicUser.Id,
+			Message:   "placeholder message",
+			Type:      model.PostTypeBurnOnRead,
+		}
+
+		resultPost, appErr := th.App.getBurnOnReadPost(th.Context, post)
+
+		require.NotNil(t, appErr)
+		require.Nil(t, resultPost)
+		assert.Equal(t, "app.post.get_post.app_error", appErr.Id)
+		assert.Equal(t, http.StatusInternalServerError, appErr.StatusCode)
+	})
+}
+
+func TestPostChannelMentionsWithPrivateChannels(t *testing.T) {
+	mainHelper.Parallel(t)
+	th := Setup(t).InitBasic(t)
+
+	channel := th.BasicChannel
+	user := th.BasicUser
+
+	// Create context with session for the user to properly test sanitization
+	ctx := th.Context.WithSession(&model.Session{UserId: user.Id})
+
+	// Create a private channel where user IS a member
+	privateChannelMember, err := th.App.CreateChannel(th.Context, &model.Channel{
+		DisplayName: "Private Member",
+		Name:        "private-member",
+		Type:        model.ChannelTypePrivate,
+		TeamId:      th.BasicTeam.Id,
+	}, false)
+	require.Nil(t, err)
+	th.AddUserToChannel(t, user, privateChannelMember)
+
+	// Create a private channel where user is NOT a member
+	privateChannelNonMember, err := th.App.CreateChannel(th.Context, &model.Channel{
+		DisplayName: "Private Non-Member",
+		Name:        "private-non-member",
+		Type:        model.ChannelTypePrivate,
+		TeamId:      th.BasicTeam.Id,
+	}, false)
+	require.Nil(t, err)
+
+	// Create a public channel where user is NOT a member
+	publicChannel, err := th.App.CreateChannel(th.Context, &model.Channel{
+		DisplayName: "Public Channel",
+		Name:        "public-channel",
+		Type:        model.ChannelTypeOpen,
+		TeamId:      th.BasicTeam.Id,
+	}, false)
+	require.Nil(t, err)
+
+	post := &model.Post{
+		Message:       fmt.Sprintf("~%v and ~%v and ~%v", privateChannelMember.Name, privateChannelNonMember.Name, publicChannel.Name),
+		ChannelId:     channel.Id,
+		PendingPostId: model.NewId() + ":" + fmt.Sprint(model.GetMillis()),
+		UserId:        user.Id,
+		CreateAt:      0,
+	}
+
+	post, _, err = th.App.CreatePostAsUser(ctx, post, "", true)
+	require.Nil(t, err)
+
+	mentions := post.GetProp(model.PostPropsChannelMentions)
+	require.NotNil(t, mentions)
+	mentionsMap, ok := mentions.(map[string]any)
+	require.True(t, ok)
+
+	// Should include private channel where user IS a member
+	assert.Contains(t, mentionsMap, privateChannelMember.Name)
+
+	// Should NOT include private channel where user is NOT a member
+	assert.NotContains(t, mentionsMap, privateChannelNonMember.Name)
+
+	// Should include public channel (user has team access)
+	assert.Contains(t, mentionsMap, publicChannel.Name)
+}
+
+func TestGetPostsForView(t *testing.T) {
+	mainHelper.Parallel(t)
+
+	t.Run("returns posts for channel", func(t *testing.T) {
+		mainHelper.Parallel(t)
+		th := Setup(t).InitBasic(t)
+
+		// Create a few posts
+		post1, _, err := th.App.CreatePost(th.Context, &model.Post{
+			ChannelId: th.BasicChannel.Id,
+			UserId:    th.BasicUser.Id,
+			Message:   "post 1",
+		}, th.BasicChannel, model.CreatePostFlags{})
+		require.Nil(t, err)
+
+		post2, _, err := th.App.CreatePost(th.Context, &model.Post{
+			ChannelId: th.BasicChannel.Id,
+			UserId:    th.BasicUser.Id,
+			Message:   "post 2",
+		}, th.BasicChannel, model.CreatePostFlags{})
+		require.Nil(t, err)
+
+		options := model.GetPostsOptions{
+			ChannelId: th.BasicChannel.Id,
+			Page:      0,
+			PerPage:   10,
+			UserId:    th.BasicUser.Id,
+		}
+
+		postList, appErr := th.App.GetPostsForView(th.Context, options)
+		require.Nil(t, appErr)
+		require.NotNil(t, postList)
+		assert.Contains(t, postList.Posts, post1.Id)
+		assert.Contains(t, postList.Posts, post2.Id)
+	})
+
+	t.Run("returns empty list for channel with no posts", func(t *testing.T) {
+		mainHelper.Parallel(t)
+		th := Setup(t).InitBasic(t)
+
+		channel := th.CreateChannel(t, th.BasicTeam)
+
+		options := model.GetPostsOptions{
+			ChannelId: channel.Id,
+			Page:      0,
+			PerPage:   10,
+			UserId:    th.BasicUser.Id,
+		}
+
+		postList, appErr := th.App.GetPostsForView(th.Context, options)
+		require.Nil(t, appErr)
+		require.NotNil(t, postList)
+		assert.Empty(t, postList.Posts)
+	})
+
+	t.Run("respects pagination", func(t *testing.T) {
+		mainHelper.Parallel(t)
+		th := Setup(t).InitBasic(t)
+
+		channel := th.CreateChannel(t, th.BasicTeam)
+
+		for i := range 5 {
+			_, _, err := th.App.CreatePost(th.Context, &model.Post{
+				ChannelId: channel.Id,
+				UserId:    th.BasicUser.Id,
+				Message:   fmt.Sprintf("post %d", i),
+			}, channel, model.CreatePostFlags{})
+			require.Nil(t, err)
+		}
+
+		options := model.GetPostsOptions{
+			ChannelId: channel.Id,
+			Page:      0,
+			PerPage:   2,
+			UserId:    th.BasicUser.Id,
+		}
+
+		postList, appErr := th.App.GetPostsForView(th.Context, options)
+		require.Nil(t, appErr)
+		require.NotNil(t, postList)
+		assert.Len(t, postList.Posts, 2)
+	})
+
+	t.Run("invalid channel id returns error", func(t *testing.T) {
+		mainHelper.Parallel(t)
+		th := Setup(t).InitBasic(t)
+
+		options := model.GetPostsOptions{
+			ChannelId: model.NewId(),
+			Page:      0,
+			PerPage:   10,
+			UserId:    th.BasicUser.Id,
+		}
+
+		postList, appErr := th.App.GetPostsForView(th.Context, options)
+		require.Nil(t, appErr)
+		require.NotNil(t, postList)
+		assert.Empty(t, postList.Posts)
 	})
 }

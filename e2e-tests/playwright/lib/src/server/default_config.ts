@@ -2,10 +2,10 @@
 // See LICENSE.txt for license information.
 
 import merge from 'deepmerge';
-import {
+import type {
+    AccessControlSettings,
     AdminConfig,
     ClusterSettings,
-    CollapsedThreads,
     EmailSettings,
     ExperimentalSettings,
     LogSettings,
@@ -14,6 +14,7 @@ import {
     ServiceSettings,
     TeamSettings,
 } from '@mattermost/types/config';
+import {CollapsedThreads} from '@mattermost/types/config';
 
 import {testConfig} from '@/test_config';
 
@@ -26,6 +27,7 @@ export function mergeWithOnPremServerConfig(overrides: Partial<AdminConfig>): Ad
 }
 
 type TestAdminConfig = {
+    AccessControlSettings: Partial<AccessControlSettings>;
     ClusterSettings: Partial<ClusterSettings>;
     EmailSettings: Partial<EmailSettings>;
     ExperimentalSettings: Partial<ExperimentalSettings>;
@@ -39,18 +41,23 @@ type TestAdminConfig = {
 // On-prem setting that is different from the default
 const onPremServerConfig = (): Partial<TestAdminConfig> => {
     return {
+        AccessControlSettings: {
+            EnableAttributeBasedAccessControl: true,
+            EnableUserManagedAttributes: true,
+        },
         ClusterSettings: {
             Enable: testConfig.haClusterEnabled,
             ClusterName: testConfig.haClusterName,
         },
         EmailSettings: {
+            FeedbackName: 'Mattermost',
             PushNotificationServer: testConfig.pushNotificationServer,
         },
         LogSettings: {
             EnableDiagnostics: false,
         },
         PasswordSettings: {
-            MinimumLength: 5,
+            MinimumLength: 14,
             Lowercase: false,
             Number: false,
             Uppercase: false,
@@ -72,11 +79,17 @@ const onPremServerConfig = (): Partial<TestAdminConfig> => {
             },
         },
         ServiceSettings: {
-            SiteURL: testConfig.baseURL,
+            // SiteURL is the server's own view of itself (e.g. for building plugin callback
+            // URLs), so it must use an address the server can reach itself with. In `testcontainers` mode
+            // testConfig.baseURL is a host-mapped port the server's own container can't reach;
+            // internalBaseURL is the Docker network alias there, and the same as baseURL in
+            // `external` mode — correct in both cases.
+            SiteURL: testConfig.internalBaseURL,
             EnableOnboardingFlow: false,
             EnableSecurityFixAlert: false,
             GiphySdkKey: 's0glxvzVg9azvPipKxcPLpXV0q1x1fVP',
             EnableTesting: true,
+            AllowedUntrustedInternalConnections: 'localhost 127.0.0.1',
         },
         TeamSettings: {
             EnableOpenServer: true,
@@ -86,7 +99,7 @@ const onPremServerConfig = (): Partial<TestAdminConfig> => {
 };
 
 // Should be based only from the generated default config from ./server via "make config-reset"
-// Based on v11.3 server
+// Based on v11.9 server
 const defaultServerConfig: AdminConfig = {
     ServiceSettings: {
         SiteURL: '',
@@ -111,6 +124,7 @@ const defaultServerConfig: AdminConfig = {
         GoroutineHealthThreshold: -1,
         EnableOAuthServiceProvider: true,
         EnableDynamicClientRegistration: false,
+        DCRRedirectURIAllowlist: [],
         EnableIncomingWebhooks: true,
         EnableOutgoingWebhooks: true,
         EnableOutgoingOAuthConnections: false,
@@ -132,6 +146,7 @@ const defaultServerConfig: AdminConfig = {
         EnableMultifactorAuthentication: false,
         EnforceMultifactorAuthentication: false,
         EnableUserAccessTokens: false,
+        MaximumPersonalAccessTokenLifetimeDays: 0,
         AllowCorsFrom: '',
         CorsExposedHeaders: '',
         CorsAllowCredentials: false,
@@ -174,6 +189,7 @@ const defaultServerConfig: AdminConfig = {
         EnableAPIUserDeletion: false,
         EnableAPIPostDeletion: false,
         EnableDesktopLandingPage: true,
+        MinimumDesktopAppVersion: '',
         ExperimentalEnableHardenedMode: false,
         ExperimentalStrictCSRFEnforcement: false,
         EnableEmailInvitations: false,
@@ -230,11 +246,13 @@ const defaultServerConfig: AdminConfig = {
         EnableLastActiveTime: true,
         UserStatusAwayTimeout: 300,
         MaxChannelsPerTeam: 2000,
+        EnableChannelCategorySorting: true,
         MaxNotificationsPerChannel: 1000,
         EnableConfirmNotificationsToChannel: true,
         TeammateNameDisplay: 'username',
         ExperimentalEnableAutomaticReplies: false,
         LockTeammateNameDisplay: false,
+        LockProfileFieldsForEmailUsers: 'none',
         ExperimentalPrimaryTeam: '',
         ExperimentalDefaultChannels: [],
     },
@@ -247,7 +265,7 @@ const defaultServerConfig: AdminConfig = {
     SqlSettings: {
         DriverName: 'postgres',
         DataSource:
-            'postgres://mmuser:mostest@localhost/mattermost_test?sslmode=disable\u0026connect_timeout=10\u0026binary_parameters=yes',
+            'postgres://mmuser:mostest_password@localhost/mattermost_test?sslmode=disable\u0026connect_timeout=10\u0026binary_parameters=yes',
         DataSourceReplicas: [],
         DataSourceSearchReplicas: [],
         MaxIdleConns: 50,
@@ -257,6 +275,7 @@ const defaultServerConfig: AdminConfig = {
         Trace: false,
         AtRestEncryptKey: '',
         QueryTimeout: 30,
+        AnalyticsQueryTimeout: 300,
         DisableDatabaseSearch: false,
         MigrationsStatementTimeoutSeconds: 100000,
         ReplicaLagSettings: [],
@@ -280,11 +299,6 @@ const defaultServerConfig: AdminConfig = {
     ExperimentalAuditSettings: {
         FileEnabled: false,
         FileName: '',
-        FileMaxSizeMB: 100,
-        FileMaxAgeDays: 0,
-        FileMaxBackups: 0,
-        FileCompress: false,
-        FileMaxQueueSize: 1000,
         AdvancedLoggingJSON: {},
         Certificate: '',
     },
@@ -307,6 +321,7 @@ const defaultServerConfig: AdminConfig = {
         Directory: './data/',
         EnablePublicLink: false,
         ExtractContent: true,
+        ExtractContentTimeout: 10,
         ArchiveRecursion: false,
         PublicLinkSalt: '',
         InitialFont: 'nunito-bold.ttf',
@@ -323,6 +338,15 @@ const defaultServerConfig: AdminConfig = {
         AmazonS3RequestTimeoutMilliseconds: 30000,
         AmazonS3UploadPartSizeBytes: 5242880,
         AmazonS3StorageClass: '',
+        AzureStorageAccount: '',
+        AzureAuthMode: 'shared_key',
+        AzureAccessKey: '',
+        AzureContainer: '',
+        AzurePathPrefix: '',
+        AzureCloud: 'commercial',
+        AzureEndpoint: '',
+        AzureSSL: true,
+        AzureRequestTimeoutMilliseconds: 30000,
         DedicatedExportStore: false,
         ExportDriverName: 'local',
         ExportDirectory: './data/',
@@ -340,6 +364,16 @@ const defaultServerConfig: AdminConfig = {
         ExportAmazonS3PresignExpiresSeconds: 21600,
         ExportAmazonS3UploadPartSizeBytes: 104857600,
         ExportAmazonS3StorageClass: '',
+        ExportAzureStorageAccount: '',
+        ExportAzureAuthMode: 'shared_key',
+        ExportAzureAccessKey: '',
+        ExportAzureContainer: '',
+        ExportAzurePathPrefix: '',
+        ExportAzureCloud: 'commercial',
+        ExportAzureEndpoint: '',
+        ExportAzureSSL: true,
+        ExportAzureRequestTimeoutMilliseconds: 30000,
+        ExportAzurePresignExpiresSeconds: 21600,
     },
     EmailSettings: {
         EnableSignUpWithEmail: true,
@@ -371,9 +405,6 @@ const defaultServerConfig: AdminConfig = {
         EnablePreviewModeBanner: true,
         SkipServerCertificateVerification: false,
         EmailNotificationContentsType: 'full',
-        LoginButtonColor: '#0000',
-        LoginButtonBorderColor: '#2389D7',
-        LoginButtonTextColor: '#2389D7',
     },
     RateLimitSettings: {
         Enable: false,
@@ -387,6 +418,7 @@ const defaultServerConfig: AdminConfig = {
     PrivacySettings: {
         ShowEmailAddress: true,
         ShowFullName: true,
+        UseAnonymousURLs: false,
     },
     SupportSettings: {
         TermsOfServiceLink: 'https://mattermost.com/pl/terms-of-use/',
@@ -432,6 +464,7 @@ const defaultServerConfig: AdminConfig = {
         DiscoveryEndpoint: '',
         ButtonText: '',
         ButtonColor: '',
+        UsePreferredUsername: false,
     },
     GoogleSettings: {
         Enable: false,
@@ -445,6 +478,7 @@ const defaultServerConfig: AdminConfig = {
         DiscoveryEndpoint: '',
         ButtonText: '',
         ButtonColor: '',
+        UsePreferredUsername: false,
     },
     Office365Settings: {
         Enable: false,
@@ -456,6 +490,7 @@ const defaultServerConfig: AdminConfig = {
         UserAPIEndpoint: 'https://graph.microsoft.com/v1.0/me',
         DiscoveryEndpoint: '',
         DirectoryId: '',
+        UsePreferredUsername: false,
     },
     OpenIdSettings: {
         Enable: false,
@@ -468,6 +503,7 @@ const defaultServerConfig: AdminConfig = {
         DiscoveryEndpoint: '',
         ButtonText: '',
         ButtonColor: '#145DBF',
+        UsePreferredUsername: false,
     },
     LdapSettings: {
         Enable: false,
@@ -503,9 +539,6 @@ const defaultServerConfig: AdminConfig = {
         QueryTimeout: 60,
         MaxPageSize: 0,
         LoginFieldName: '',
-        LoginButtonColor: '#0000',
-        LoginButtonBorderColor: '#2389D7',
-        LoginButtonTextColor: '#2389D7',
     },
     ComplianceSettings: {
         Enable: false,
@@ -551,9 +584,6 @@ const defaultServerConfig: AdminConfig = {
         LocaleAttribute: '',
         PositionAttribute: '',
         LoginButtonText: 'SAML',
-        LoginButtonColor: '#34a28b',
-        LoginButtonBorderColor: '#2389D7',
-        LoginButtonTextColor: '#ffffff',
     },
     NativeAppSettings: {
         AppCustomURLSchemes: ['mmauth://', 'mmauthbeta://'],
@@ -615,7 +645,7 @@ const defaultServerConfig: AdminConfig = {
         DisableWakeUpReconnectHandler: false,
         UsersStatusAndProfileFetchingPollIntervalMilliseconds: 3000,
         YoutubeReferrerPolicy: false,
-        ExperimentalChannelCategorySorting: false,
+        EnableWatermark: false,
     },
     AnalyticsSettings: {
         MaxUsersForStatistics: 2500,
@@ -627,6 +657,7 @@ const defaultServerConfig: AdminConfig = {
         Password: 'changeme',
         EnableIndexing: false,
         EnableSearching: false,
+        EnableCJKAnalyzers: false,
         EnableAutocomplete: false,
         Sniff: true,
         PostIndexReplicas: 1,
@@ -648,6 +679,7 @@ const defaultServerConfig: AdminConfig = {
         ClientKey: '',
         Trace: '',
         IgnoredPurgeIndexes: '',
+        EnableSearchPublicChannelsWithoutMembership: true,
     },
     DataRetentionSettings: {
         EnableMessageDeletion: false,
@@ -663,6 +695,12 @@ const defaultServerConfig: AdminConfig = {
         TimeBetweenBatchesMilliseconds: 100,
         RetentionIdsBatchSize: 100,
         PreservePinnedPosts: false,
+    },
+    MobileEphemeralModeSettings: {
+        Enable: false,
+        DisconnectionTimeoutSeconds: 60,
+        OfflinePersistenceTimerHours: 24,
+        AutoCacheCleanupDays: 7,
     },
     MessageExportSettings: {
         EnableExport: false,
@@ -734,8 +772,6 @@ const defaultServerConfig: AdminConfig = {
     ImageProxySettings: {
         Enable: false,
         ImageProxyType: 'local',
-        RemoteImageProxyURL: '',
-        RemoteImageProxyOptions: '',
     },
     CloudSettings: {
         CWSURL: 'https://customers.mattermost.com',
@@ -753,32 +789,34 @@ const defaultServerConfig: AdminConfig = {
         EnableSharedChannelsMemberSync: false,
         EnableSyncAllUsersForRemoteCluster: false,
         AppsEnabled: false,
-        PermalinkPreviews: false,
         NormalizeLdapDNs: false,
         WysiwygEditor: false,
-        OnboardingTourTips: true,
-        DeprecateCloudFree: false,
-        EnableExportDirectDownload: false,
         MoveThreadsEnabled: false,
-        StreamlinedMarketplace: true,
-        CloudIPFiltering: false,
-        ConsumePostHook: false,
-        CloudAnnualRenewals: false,
-        CloudDedicatedExportUI: false,
-        ChannelBookmarks: true,
-        WebSocketEventScope: true,
         NotificationMonitoring: true,
-        ExperimentalAuditSettingsSystemConsoleUI: true,
-        CustomProfileAttributes: true,
-        AttributeBasedAccessControl: true,
+        AttributeValueMasking: false,
+        PermissionPolicies: false,
+        ChannelPermissionPolicies: false,
+        PolicySimulation: false,
         ContentFlagging: true,
-        InteractiveDialogAppsForm: true,
         EnableMattermostEntry: true,
-        MobileSSOCodeExchange: true,
-        AutoTranslation: false,
+        MobileSSOCodeExchange: false,
+        EnableShiftEscapeToMarkAllRead: false,
+        AutoTranslation: true,
+        ClassificationMarkings: true,
         BurnOnRead: true,
         EnableAIPluginBridge: false,
         EnableAIRecaps: false,
+        IntegratedBoards: true,
+        CJKSearch: true,
+        AggregatePluginMetrics: false,
+        ManagedChannelCategories: false,
+        SessionAttributes: false,
+        DiscoverableChannels: false,
+        MobileEphemeralMode: false,
+        PropertyFieldRank: false,
+        TeamMembershipAccessControl: true,
+        MmBlocksEnabled: true,
+        EnableConcurrentReact: true,
     },
     ImportSettings: {
         Directory: './import',
@@ -808,8 +846,11 @@ const defaultServerConfig: AdminConfig = {
     },
     AccessControlSettings: {
         EnableAttributeBasedAccessControl: false,
-        EnableChannelScopeAccessControl: true,
         EnableUserManagedAttributes: false,
+        EnableChannelPolicyIndicators: true,
+        TrustProxyDeviceIdentityHeader: false,
+        EnforceDeviceIDConsistency: false,
+        EnableAccessControlAuditLogging: false,
     },
     ContentFlaggingSettings: {
         EnableContentFlagging: false,
@@ -823,11 +864,13 @@ const defaultServerConfig: AdminConfig = {
         },
         AdditionalSettings: {
             Reasons: [
-                'Inappropriate content',
-                'Sensitive data',
-                'Security concern',
-                'Harassment or abuse',
-                'Spam or phishing',
+                'Classification mismatch',
+                'Need-to-know violation',
+                'Personally identifiable information (PII) exposure',
+                'Operational security (OPSEC) concern',
+                'Controlled Unclassified Information (CUI) violation',
+                'Unauthorized disclosure',
+                'Other',
             ],
             ReporterCommentRequired: true,
             ReviewerCommentRequired: true,
@@ -843,14 +886,11 @@ const defaultServerConfig: AdminConfig = {
     },
     AutoTranslationSettings: {
         Enable: false,
+        RestrictDMAndGM: false,
         Provider: '',
         TargetLanguages: ['en'],
-        TimeoutsMs: {
-            Short: 1200,
-            Medium: 2500,
-            Long: 6000,
-            Notification: 300,
-        },
+        Workers: 6,
+        TimeoutMs: 5000,
         LibreTranslate: {
             URL: '',
             APIKey: '',
@@ -858,5 +898,24 @@ const defaultServerConfig: AdminConfig = {
         Agents: {
             LLMServiceID: '',
         },
+    },
+    AIRecapSettings: {
+        Enable: true,
+        DefaultLimits: {
+            MaxRecapsPerDay: 10,
+            MaxScheduledRecaps: 5,
+            MaxChannelsPerRecap: -1,
+            MaxPostsPerRecap: 500,
+            MaxTokensPerRecap: 100000,
+            MaxPostsPerDay: 5000,
+            CooldownMinutes: 60,
+        },
+        EnforceRecapsPerDay: true,
+        EnforceScheduledRecaps: true,
+        EnforceChannelsPerRecap: true,
+        EnforcePostsPerRecap: true,
+        EnforceTokensPerRecap: true,
+        EnforcePostsPerDay: true,
+        EnforceCooldown: true,
     },
 };

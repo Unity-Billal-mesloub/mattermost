@@ -2,15 +2,18 @@
 // See LICENSE.txt for license information.
 
 import React from 'react';
+import {act} from 'react-dom/test-utils';
 
 import PluginState from 'mattermost-redux/constants/plugins';
 
-import PluginManagement from 'components/admin_console/plugin_management/plugin_management';
+import {PluginManagement} from 'components/admin_console/plugin_management/plugin_management';
 
-import {shallowWithIntl} from 'tests/helpers/intl-test-helper';
+import {defaultIntl} from 'tests/helpers/intl-test-helper';
+import {createEvent, fireEvent, renderWithContext, screen, userEvent, waitFor} from 'tests/react_testing_utils';
 
 describe('components/PluginManagement', () => {
     const defaultProps = {
+        intl: defaultIntl,
         config: {
             PluginSettings: {
                 Enable: true,
@@ -105,8 +108,8 @@ describe('components/PluginManagement', () => {
 
     test('should match snapshot', () => {
         const props = {...defaultProps};
-        const wrapper = shallowWithIntl(<PluginManagement {...props}/>);
-        expect(wrapper).toMatchSnapshot();
+        const {container} = renderWithContext(<PluginManagement {...props}/>);
+        expect(container).toMatchSnapshot();
     });
 
     test('should match snapshot, disabled', () => {
@@ -120,8 +123,8 @@ describe('components/PluginManagement', () => {
                 },
             },
         };
-        const wrapper = shallowWithIntl(<PluginManagement {...props}/>);
-        expect(wrapper).toMatchSnapshot();
+        const {container} = renderWithContext(<PluginManagement {...props}/>);
+        expect(container).toMatchSnapshot();
     });
 
     test('should match snapshot when `Enable Plugins` is hidden', () => {
@@ -134,8 +137,8 @@ describe('components/PluginManagement', () => {
                 },
             },
         };
-        const wrapper = shallowWithIntl(<PluginManagement {...props}/>);
-        expect(wrapper).toMatchSnapshot();
+        const {container} = renderWithContext(<PluginManagement {...props}/>);
+        expect(container).toMatchSnapshot();
     });
 
     test('should match snapshot when `Require Signature Plugin` is true', () => {
@@ -149,8 +152,8 @@ describe('components/PluginManagement', () => {
                 },
             },
         };
-        const wrapper = shallowWithIntl(<PluginManagement {...props}/>);
-        expect(wrapper).toMatchSnapshot();
+        const {container} = renderWithContext(<PluginManagement {...props}/>);
+        expect(container).toMatchSnapshot();
     });
 
     test('should match snapshot when `Enable Marketplace` is false', () => {
@@ -164,8 +167,8 @@ describe('components/PluginManagement', () => {
                 },
             },
         };
-        const wrapper = shallowWithIntl(<PluginManagement {...props}/>);
-        expect(wrapper).toMatchSnapshot();
+        const {container} = renderWithContext(<PluginManagement {...props}/>);
+        expect(container).toMatchSnapshot();
     });
 
     test('should match snapshot when `Enable Remote Marketplace` is false', () => {
@@ -179,8 +182,8 @@ describe('components/PluginManagement', () => {
                 },
             },
         };
-        const wrapper = shallowWithIntl(<PluginManagement {...props}/>);
-        expect(wrapper).toMatchSnapshot();
+        const {container} = renderWithContext(<PluginManagement {...props}/>);
+        expect(container).toMatchSnapshot();
     });
 
     test('should match snapshot, upload disabled', () => {
@@ -194,8 +197,8 @@ describe('components/PluginManagement', () => {
                 },
             },
         };
-        const wrapper = shallowWithIntl(<PluginManagement {...props}/>);
-        expect(wrapper).toMatchSnapshot();
+        const {container} = renderWithContext(<PluginManagement {...props}/>);
+        expect(container).toMatchSnapshot();
     });
 
     test('should match snapshot, allow insecure URL enabled', () => {
@@ -209,20 +212,29 @@ describe('components/PluginManagement', () => {
                 },
             },
         };
-        const wrapper = shallowWithIntl(<PluginManagement {...props}/>);
-        expect(wrapper).toMatchSnapshot();
+        const {container} = renderWithContext(<PluginManagement {...props}/>);
+        expect(container).toMatchSnapshot();
     });
 
     test('should match snapshot, text entered into the URL install text box', () => {
         const props = defaultProps;
 
-        const wrapper = shallowWithIntl(<PluginManagement {...props}/>);
-        wrapper.setState({pluginDownloadUrl: 'https://pluginsite.com/plugin.tar.gz'});
-        expect(wrapper).toMatchSnapshot();
+        const ref = React.createRef<InstanceType<typeof PluginManagement>>();
+        const {container} = renderWithContext(
+            <PluginManagement
+                {...props}
+                ref={ref}
+            />,
+        );
+        act(() => {
+            ref.current!.setState({pluginDownloadUrl: 'https://pluginsite.com/plugin.tar.gz'} as any);
+        });
+        expect(container).toMatchSnapshot();
     });
 
     test('should match snapshot, No installed plugins', () => {
         const props = {
+            ...defaultProps,
             config: {
                 ...defaultProps.config,
                 PluginSettings: {
@@ -245,19 +257,36 @@ describe('components/PluginManagement', () => {
                 disablePlugin: jest.fn(),
             },
         };
-        const wrapper = shallowWithIntl(<PluginManagement {...props}/>);
-        wrapper.setState({loading: false});
-        expect(wrapper).toMatchSnapshot();
+        const ref = React.createRef<InstanceType<typeof PluginManagement>>();
+        const {container} = renderWithContext(
+            <PluginManagement
+                {...props}
+                ref={ref}
+            />,
+        );
+        act(() => {
+            ref.current!.setState({loading: false} as any);
+        });
+        expect(container).toMatchSnapshot();
     });
 
     test('should match snapshot, with installed plugins', () => {
-        const wrapper = shallowWithIntl(<PluginManagement {...defaultProps}/>);
-        wrapper.setState({loading: false});
-        expect(wrapper).toMatchSnapshot();
+        const ref = React.createRef<InstanceType<typeof PluginManagement>>();
+        const {container} = renderWithContext(
+            <PluginManagement
+                {...defaultProps}
+                ref={ref}
+            />,
+        );
+        act(() => {
+            ref.current!.setState({loading: false} as any);
+        });
+        expect(container).toMatchSnapshot();
     });
 
     test('should match snapshot, with installed plugins and not settings link should set hasSettings to false', () => {
         const props = {
+            ...defaultProps,
             config: {
                 ...defaultProps.config,
                 PluginSettings: {
@@ -335,13 +364,22 @@ describe('components/PluginManagement', () => {
                 disablePlugin: jest.fn(),
             },
         };
-        const wrapper = shallowWithIntl(<PluginManagement {...props}/>);
-        wrapper.setState({loading: false});
-        expect(wrapper).toMatchSnapshot();
+        const ref = React.createRef<InstanceType<typeof PluginManagement>>();
+        const {container} = renderWithContext(
+            <PluginManagement
+                {...props}
+                ref={ref}
+            />,
+        );
+        act(() => {
+            ref.current!.setState({loading: false} as any);
+        });
+        expect(container).toMatchSnapshot();
     });
 
     test('should match snapshot, with installed plugins and just header should set hasSettings to true', () => {
         const props = {
+            ...defaultProps,
             config: {
                 ...defaultProps.config,
                 PluginSettings: {
@@ -392,13 +430,22 @@ describe('components/PluginManagement', () => {
                 disablePlugin: jest.fn(),
             },
         };
-        const wrapper = shallowWithIntl(<PluginManagement {...props}/>);
-        wrapper.setState({loading: false});
-        expect(wrapper).toMatchSnapshot();
+        const ref = React.createRef<InstanceType<typeof PluginManagement>>();
+        const {container} = renderWithContext(
+            <PluginManagement
+                {...props}
+                ref={ref}
+            />,
+        );
+        act(() => {
+            ref.current!.setState({loading: false} as any);
+        });
+        expect(container).toMatchSnapshot();
     });
 
     test('should match snapshot, with installed plugins and just footer should set hasSettings to true', () => {
         const props = {
+            ...defaultProps,
             config: {
                 ...defaultProps.config,
                 PluginSettings: {
@@ -439,7 +486,6 @@ describe('components/PluginManagement', () => {
                 },
             },
             appsFeatureFlagEnabled: false,
-            streamlinedMarketplaceFlagEnabled: false,
             actions: {
                 uploadPlugin: jest.fn(),
                 installPluginFromUrl: jest.fn(),
@@ -450,13 +496,22 @@ describe('components/PluginManagement', () => {
                 disablePlugin: jest.fn(),
             },
         };
-        const wrapper = shallowWithIntl(<PluginManagement {...props}/>);
-        wrapper.setState({loading: false});
-        expect(wrapper).toMatchSnapshot();
+        const ref = React.createRef<InstanceType<typeof PluginManagement>>();
+        const {container} = renderWithContext(
+            <PluginManagement
+                {...props}
+                ref={ref}
+            />,
+        );
+        act(() => {
+            ref.current!.setState({loading: false} as any);
+        });
+        expect(container).toMatchSnapshot();
     });
 
     test('should match snapshot, with installed plugins and just settings should set hasSettings to true', () => {
         const props = {
+            ...defaultProps,
             config: {
                 ...defaultProps.config,
                 PluginSettings: {
@@ -509,8 +564,255 @@ describe('components/PluginManagement', () => {
                 disablePlugin: jest.fn(),
             },
         };
-        const wrapper = shallowWithIntl(<PluginManagement {...props}/>);
-        wrapper.setState({loading: false});
-        expect(wrapper).toMatchSnapshot();
+        const ref = React.createRef<InstanceType<typeof PluginManagement>>();
+        const {container} = renderWithContext(
+            <PluginManagement
+                {...props}
+                ref={ref}
+            />,
+        );
+        act(() => {
+            ref.current!.setState({loading: false} as any);
+        });
+        expect(container).toMatchSnapshot();
+    });
+
+    test('uploads the selected plugin bundle immediately', async () => {
+        const uploadPlugin = jest.fn().mockResolvedValue({data: {}});
+        const getPlugins = jest.fn().mockResolvedValue({data: {}});
+        const props = {
+            ...defaultProps,
+            actions: {
+                ...defaultProps.actions,
+                uploadPlugin,
+                getPlugins,
+            },
+        };
+        const {container} = renderWithContext(<PluginManagement {...props}/>);
+
+        const input = container.querySelector('input[type="file"]') as HTMLInputElement;
+        const file = new File(['plugin'], 'sample-plugin.tar.gz', {type: 'application/gzip'});
+        await userEvent.upload(input, file);
+
+        await waitFor(() => {
+            expect(uploadPlugin).toHaveBeenCalledWith(file, false);
+            expect(getPlugins).toHaveBeenCalled();
+        });
+    });
+
+    test('shows upload progress while the selected bundle is uploading', async () => {
+        let resolveUpload: (value: {data: Record<string, never>}) => void = () => {};
+        const uploadPlugin = jest.fn().mockImplementation(() => new Promise((resolve) => {
+            resolveUpload = resolve;
+        }));
+        const props = {
+            ...defaultProps,
+            actions: {
+                ...defaultProps.actions,
+                uploadPlugin,
+            },
+        };
+        const {container} = renderWithContext(<PluginManagement {...props}/>);
+
+        const input = container.querySelector('input[type="file"]') as HTMLInputElement;
+        const file = new File(['plugin'], 'sample-plugin.tar.gz', {type: 'application/gzip'});
+        await userEvent.upload(input, file);
+
+        expect(screen.getByRole('progressbar', {name: 'Plugin upload progress'})).toBeInTheDocument();
+
+        resolveUpload({data: {}});
+        await waitFor(() => {
+            expect(screen.queryByRole('progressbar', {name: 'Plugin upload progress'})).not.toBeInTheDocument();
+        });
+    });
+
+    test('keeps the dropzone active when dragging between child elements', () => {
+        renderWithContext(<PluginManagement {...defaultProps}/>);
+
+        const dropzone = screen.getByRole('button', {name: /Click or drop plugin bundle to upload/});
+        const dropzoneTitle = dropzone.querySelector('.PluginManagement__uploadDropzoneTitle');
+        expect(dropzoneTitle).not.toBeNull();
+
+        fireEvent.dragEnter(dropzone);
+        expect(dropzone).toHaveClass('PluginManagement__uploadDropzone--active');
+
+        const dragLeaveChild = createEvent.dragLeave(dropzone);
+        Object.defineProperty(dragLeaveChild, 'relatedTarget', {value: dropzoneTitle});
+        fireEvent(dropzone, dragLeaveChild);
+        expect(dropzone).toHaveClass('PluginManagement__uploadDropzone--active');
+
+        const dragLeaveDropzone = createEvent.dragLeave(dropzone);
+        Object.defineProperty(dragLeaveDropzone, 'relatedTarget', {value: document.body});
+        fireEvent(dropzone, dragLeaveDropzone);
+        expect(dropzone).not.toHaveClass('PluginManagement__uploadDropzone--active');
+    });
+
+    test('explains why direct upload is disabled when plugin signatures are required', () => {
+        const props = {
+            ...defaultProps,
+            config: {
+                ...defaultProps.config,
+                PluginSettings: {
+                    ...defaultProps.config.PluginSettings,
+                    RequirePluginSignature: true,
+                },
+            },
+        };
+        renderWithContext(<PluginManagement {...props}/>);
+
+        expect(screen.getByRole('button', {name: /Click or drop plugin bundle to upload/})).toBeDisabled();
+        expect(screen.getByText('Plugin signatures are required. Install plugins through Marketplace instead.')).toBeInTheDocument();
+    });
+
+    test('explains why direct upload is disabled when plugin uploads are disabled', () => {
+        const props = {
+            ...defaultProps,
+            config: {
+                ...defaultProps.config,
+                PluginSettings: {
+                    ...defaultProps.config.PluginSettings,
+                    EnableUploads: false,
+                },
+            },
+        };
+        renderWithContext(<PluginManagement {...props}/>);
+
+        expect(screen.getByRole('button', {name: /Click or drop plugin bundle to upload/})).toBeDisabled();
+        expect(screen.getByText('Plugin uploads are disabled. Enable plugin uploads in config.json before uploading a plugin.')).toBeInTheDocument();
+    });
+
+    test('explains why direct upload is disabled when the user lacks permission', () => {
+        const props = {
+            ...defaultProps,
+            isDisabled: true,
+        };
+        renderWithContext(<PluginManagement {...props}/>);
+
+        expect(screen.getByRole('button', {name: /Click or drop plugin bundle to upload/})).toBeDisabled();
+        expect(screen.getByText('You need permission to manage plugins before uploading a plugin.')).toBeInTheDocument();
+    });
+
+    test('explains why direct upload is disabled when plugins are not enabled', () => {
+        const props = {
+            ...defaultProps,
+            config: {
+                ...defaultProps.config,
+                PluginSettings: {
+                    ...defaultProps.config.PluginSettings,
+                    Enable: false,
+                },
+            },
+        };
+        renderWithContext(<PluginManagement {...props}/>);
+
+        expect(screen.getByRole('button', {name: /Click or drop plugin bundle to upload/})).toBeDisabled();
+        expect(screen.getByText('Enable plugins before uploading a plugin.')).toBeInTheDocument();
+    });
+
+    test('uploads a dropped plugin bundle', async () => {
+        const uploadPlugin = jest.fn().mockResolvedValue({data: {}});
+        const getPlugins = jest.fn().mockResolvedValue({data: {}});
+        const props = {
+            ...defaultProps,
+            actions: {
+                ...defaultProps.actions,
+                uploadPlugin,
+                getPlugins,
+            },
+        };
+        renderWithContext(<PluginManagement {...props}/>);
+
+        const dropzone = screen.getByRole('button', {name: /Click or drop plugin bundle to upload/});
+        const file = new File(['plugin'], 'sample-plugin.tar.gz', {type: 'application/gzip'});
+
+        fireEvent.drop(dropzone, {dataTransfer: {files: [file]}});
+
+        await waitFor(() => {
+            expect(uploadPlugin).toHaveBeenCalledWith(file, false);
+            expect(getPlugins).toHaveBeenCalled();
+        });
+    });
+
+    const overwriteUpload = async (data: {id: string; name: string; version: string}) => {
+        const uploadPlugin = jest.fn().
+            mockResolvedValueOnce({error: {server_error_id: 'app.plugin.install_id.app_error', message: 'A plugin with this ID already exists.'}}).
+            mockResolvedValueOnce({data});
+        const getPlugins = jest.fn().mockResolvedValue({data: {}});
+        const props = {
+            ...defaultProps,
+            actions: {
+                ...defaultProps.actions,
+                uploadPlugin,
+                getPlugins,
+            },
+        };
+        const {container} = renderWithContext(<PluginManagement {...props}/>);
+
+        const input = container.querySelector('input[type="file"]') as HTMLInputElement;
+        const file = new File(['plugin'], 'sample-plugin.tar.gz', {type: 'application/gzip'});
+        await userEvent.upload(input, file);
+
+        const confirmButton = await screen.findByText('Overwrite');
+        await userEvent.click(confirmButton);
+
+        await waitFor(() => {
+            expect(uploadPlugin).toHaveBeenCalledWith(file, true);
+        });
+    };
+
+    test('formats an upgraded plugin overwrite message when the new version is newer', async () => {
+        await overwriteUpload({id: 'plugin_0', name: 'Plugin 0', version: '0.2.0'});
+
+        expect(await screen.findByText('Successfully upgraded plugin: Plugin 0 (v0.1.0 → v0.2.0)')).toBeInTheDocument();
+    });
+
+    test('formats a downgraded plugin overwrite message when the new version is older', async () => {
+        await overwriteUpload({id: 'plugin_0', name: 'Plugin 0', version: '0.0.9'});
+
+        expect(await screen.findByText('Successfully downgraded plugin: Plugin 0 (v0.1.0 → v0.0.9)')).toBeInTheDocument();
+    });
+
+    test('formats a same-version plugin overwrite message when the version is unchanged', async () => {
+        await overwriteUpload({id: 'plugin_0', name: 'Plugin 0', version: '0.1.0'});
+
+        expect(await screen.findByText('Successfully replaced plugin: Plugin 0 (same version v0.1.0)')).toBeInTheDocument();
+    });
+
+    test('falls back to a generic overwrite message when versions are missing or invalid semver', async () => {
+        await overwriteUpload({id: 'plugin_unknown', name: 'Plugin Unknown', version: 'not-a-version'});
+
+        expect(await screen.findByText('Successfully updated plugin: Plugin Unknown')).toBeInTheDocument();
+    });
+
+    test('should show the settings link for a plugin with sections only', () => {
+        const props = {
+            ...defaultProps,
+            pluginStatuses: {
+                plugin_0: defaultProps.pluginStatuses.plugin_0,
+            },
+            plugins: {
+                plugin_0: {
+                    ...defaultProps.plugins.plugin_0,
+                    settings_schema: {
+                        sections: [{
+                            key: 'section',
+                            settings: [],
+                        }],
+                    },
+                },
+            },
+        };
+        const ref = React.createRef<InstanceType<typeof PluginManagement>>();
+        renderWithContext(
+            <PluginManagement
+                {...props}
+                ref={ref}
+            />,
+        );
+        act(() => {
+            ref.current!.setState({loading: false} as any);
+        });
+
+        expect(screen.getByText('Settings')).toBeInTheDocument();
     });
 });

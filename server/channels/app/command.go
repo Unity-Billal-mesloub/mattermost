@@ -67,12 +67,22 @@ func (a *App) CreateCommandPost(rctx request.CTX, post *model.Post, teamID strin
 	}
 
 	if response.Attachments != nil {
-		model.ParseSlackAttachment(post, response.Attachments)
+		model.ParseMessageAttachment(post, response.Attachments)
 	}
 
 	if response.ResponseType == model.CommandResponseTypeInChannel {
-		// The post is only used for tests, so even if there are membership issues, we won't send the post to the client.
-		createdPost, _, appErr := a.CreatePostMissingChannel(rctx, post, true, true)
+		// Bot-style (non-builtin) command responses are flagged via from_webhook by HandleCommandResponsePost.
+		// Strip the prop here and pass the marker through the server-set FromIncomingWebhook flag so
+		// SanitizeProps does not drop it on save.
+		fromWebhook := post.GetProp(model.PostPropsFromWebhook) == "true"
+		if fromWebhook {
+			post.DelProp(model.PostPropsFromWebhook)
+		}
+		createdPost, _, appErr := a.CreatePostMissingChannelWithFlags(rctx, post, model.CreatePostFlags{
+			TriggerWebhooks:     true,
+			SetOnline:           true,
+			FromIncomingWebhook: fromWebhook,
+		})
 		if appErr != nil {
 			return nil, appErr
 		}
@@ -412,7 +422,7 @@ func (a *App) tryExecuteCustomCommand(rctx request.CTX, args *model.CommandArgs,
 
 	userChan := make(chan store.StoreResult[*model.User], 1)
 	go func() {
-		user, err := a.Srv().Store().User().Get(context.Background(), args.UserId)
+		user, err := a.Srv().Store().User().Get(rctx, args.UserId)
 		userChan <- store.StoreResult[*model.User]{Data: user, NErr: err}
 		close(userChan)
 	}()
@@ -497,11 +507,23 @@ func (a *App) tryExecuteCustomCommand(rctx request.CTX, args *model.CommandArgs,
 	channelMentionMap := a.MentionsToPublicChannels(rctx, message, team.Id)
 	maps.Copy(p, channelMentionMap.ToURLValues())
 
+	// Use configured SiteURL for response_url to prevent SSRF via Host header spoofing (MM-67142)
+	siteURL := *a.Config().ServiceSettings.SiteURL
+	if siteURL == "" {
+		return cmd, nil, model.NewAppError("tryExecuteCustomCommand", "api.command.execute_command.site_url_required.app_error", nil, "", http.StatusBadRequest)
+	}
+	if siteURL != args.SiteURL {
+		rctx.Logger().Warn(i18n.T("api.command.execute_command.provided_site_url_different.app_error"),
+			mlog.String("request_host", args.SiteURL),
+			mlog.String("configured_site_url", siteURL),
+			mlog.String("command", trigger))
+	}
+
 	hook, appErr := a.CreateCommandWebhook(cmd.Id, args)
 	if appErr != nil {
 		return cmd, nil, model.NewAppError("command", "api.command.execute_command.failed.app_error", map[string]any{"Trigger": trigger}, "", http.StatusInternalServerError).Wrap(appErr)
 	}
-	p.Set("response_url", args.SiteURL+"/hooks/commands/"+hook.Id)
+	p.Set("response_url", siteURL+"/hooks/commands/"+hook.Id)
 
 	return a.DoCommandRequest(rctx, cmd, p)
 }
@@ -587,6 +609,10 @@ func (a *App) DoCommandRequest(rctx request.CTX, cmd *model.Command, p url.Value
 		return cmd, nil, model.NewAppError("command", "api.command.execute_command.failed_empty.app_error", map[string]any{"Trigger": cmd.Trigger}, "", http.StatusInternalServerError)
 	}
 
+	if appErr := response.IsValid(); appErr != nil {
+		rctx.Logger().Warn("Command response is not valid. Please update your integration to be compliant.", mlog.Err(appErr))
+	}
+
 	return cmd, response, nil
 }
 
@@ -660,8 +686,6 @@ func (a *App) HandleCommandResponsePost(rctx request.CTX, command *model.Command
 		} else if response.IconURL != "" {
 			post.AddProp(model.PostPropsOverrideIconURL, response.IconURL)
 			isBotPost = true
-		} else {
-			post.AddProp(model.PostPropsOverrideIconURL, "")
 		}
 	}
 
@@ -672,7 +696,7 @@ func (a *App) HandleCommandResponsePost(rctx request.CTX, command *model.Command
 	// Process Slack text replacements if the response does not contain "skip_slack_parsing": true.
 	if !response.SkipSlackParsing {
 		response.Text = a.ProcessSlackText(rctx, response.Text)
-		response.Attachments = a.ProcessSlackAttachments(rctx, response.Attachments)
+		response.Attachments = a.ProcessMessageAttachments(rctx, response.Attachments)
 	}
 
 	if _, err := a.CreateCommandPost(rctx, post, args.TeamId, response, response.SkipSlackParsing); err != nil {
@@ -693,22 +717,8 @@ func (a *App) CreateCommand(cmd *model.Command) (*model.Command, *model.AppError
 func (a *App) createCommand(cmd *model.Command) (*model.Command, *model.AppError) {
 	cmd.Trigger = strings.ToLower(cmd.Trigger)
 
-	teamCmds, err := a.Srv().Store().Command().GetByTeam(cmd.TeamId)
-	if err != nil {
-		return nil, model.NewAppError("CreateCommand", "app.command.createcommand.internal_error", nil, "", http.StatusInternalServerError).Wrap(err)
-	}
-
-	for _, existingCommand := range teamCmds {
-		if cmd.Trigger == existingCommand.Trigger {
-			return nil, model.NewAppError("CreateCommand", "api.command.duplicate_trigger.app_error", nil, "", http.StatusBadRequest)
-		}
-	}
-
-	for _, builtInProvider := range commandProviders {
-		builtInCommand := builtInProvider.GetCommand(a, i18n.T)
-		if builtInCommand != nil && cmd.Trigger == builtInCommand.Trigger {
-			return nil, model.NewAppError("CreateCommand", "api.command.duplicate_trigger.app_error", nil, "", http.StatusBadRequest)
-		}
+	if appErr := a.validateCommandTriggerUniqueness(cmd.TeamId, cmd.Trigger, ""); appErr != nil {
+		return nil, appErr
 	}
 
 	command, nErr := a.Srv().Store().Command().Save(cmd)
@@ -723,6 +733,30 @@ func (a *App) createCommand(cmd *model.Command) (*model.Command, *model.AppError
 	}
 
 	return command, nil
+}
+
+func (a *App) validateCommandTriggerUniqueness(teamID, trigger, excludeCommandID string) *model.AppError {
+	trigger = strings.ToLower(trigger)
+
+	for _, builtInProvider := range commandProviders {
+		builtInCommand := builtInProvider.GetCommand(a, i18n.T)
+		if builtInCommand != nil && trigger == strings.ToLower(builtInCommand.Trigger) {
+			return model.NewAppError("validateCommandTriggerUniqueness", "api.command.duplicate_trigger.app_error", nil, "", http.StatusBadRequest)
+		}
+	}
+
+	teamCmds, err := a.Srv().Store().Command().GetByTeam(teamID)
+	if err != nil {
+		return model.NewAppError("validateCommandTriggerUniqueness", "app.command.validatecommandtriggeruniqueness.internal_error", nil, "", http.StatusInternalServerError).Wrap(err)
+	}
+
+	for _, existingCommand := range teamCmds {
+		if existingCommand.Id != excludeCommandID && trigger == strings.ToLower(existingCommand.Trigger) {
+			return model.NewAppError("validateCommandTriggerUniqueness", "api.command.duplicate_trigger.app_error", nil, "", http.StatusBadRequest)
+		}
+	}
+
+	return nil
 }
 
 func (a *App) GetCommand(commandID string) (*model.Command, *model.AppError) {
@@ -758,6 +792,10 @@ func (a *App) UpdateCommand(oldCmd, updatedCmd *model.Command) (*model.Command, 
 	updatedCmd.PluginId = oldCmd.PluginId
 	updatedCmd.TeamId = oldCmd.TeamId
 
+	if appErr := a.validateCommandTriggerUniqueness(updatedCmd.TeamId, updatedCmd.Trigger, updatedCmd.Id); appErr != nil {
+		return nil, appErr
+	}
+
 	command, err := a.Srv().Store().Command().Update(updatedCmd)
 	if err != nil {
 		var nfErr *store.ErrNotFound
@@ -776,6 +814,10 @@ func (a *App) UpdateCommand(oldCmd, updatedCmd *model.Command) (*model.Command, 
 }
 
 func (a *App) MoveCommand(team *model.Team, command *model.Command) *model.AppError {
+	if appErr := a.validateCommandTriggerUniqueness(team.Id, command.Trigger, command.Id); appErr != nil {
+		return appErr
+	}
+
 	command.TeamId = team.Id
 
 	_, err := a.Srv().Store().Command().Update(command)

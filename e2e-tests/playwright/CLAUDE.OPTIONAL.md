@@ -91,6 +91,7 @@ npm run show-report
     - Component abstractions for UI elements
     - Test utilities and fixtures
     - Server setup and management functions
+    - Testcontainers orchestration (`lib/src/containers/`) for `testcontainers` mode (see Server Setup below)
     - Visual testing support
 
 2. **`specs/` Directory**: Contains the actual test files organized by type:
@@ -135,6 +136,11 @@ Tests can be configured through environment variables:
 - `PW_SLOWMO` - Add delay between actions in ms (default: 0)
 - `PW_WORKERS` - Number of parallel workers (default: 1)
 - `PERCY_TOKEN` - Authentication token for Percy visual testing service (required for Percy tests)
+- `PW_USE_TESTCONTAINERS` - Selects `testcontainers` mode, see Server Setup below (default: false)
+- `PW_TESTCONTAINERS_SERVICES` - Comma-separated additional services to start, e.g. `minio,openldap` (default: `minio,openldap,keycloak,elasticsearch`; set to an empty string to start none)
+- `PW_TESTCONTAINERS_REUSE` - Reuse containers across repeated local runs instead of recreating them; tear down explicitly with `npm run testcontainers:down` (default: true)
+- `SERVER_IMAGE` - Mattermost server image `testcontainers` mode starts (default: `mattermostdevelopment/mattermost-enterprise-edition:master`)
+- `MM_ENV` - Comma-separated `KEY=VALUE` server config overrides for `testcontainers` mode (default: none)
 
 ## Server Setup
 
@@ -146,17 +152,30 @@ Before running tests, a Mattermost server must be available. Two options:
     cd server && make run
     ```
 
-2. **Run using Docker** (recommended for testing):
+2. **Testcontainers** (recommended for testing, and what CI uses) — no separate step needed, Playwright starts and tears down the server + dependencies itself:
     ```bash
-    # Configure environment in e2e-tests/.ci/env
-    cd e2e-tests && TEST=playwright make
+    PW_USE_TESTCONTAINERS=true npm run test
+    # Starts minio,openldap,keycloak,elasticsearch by default; add PW_TESTCONTAINERS_SERVICES=... to change (e.g. add opensearch,azurite, or set to "" to start none)
+    # Containers are reused across runs by default; tear down with `npm run testcontainers:down` (or set PW_TESTCONTAINERS_REUSE=false for a self-cleaning one-off run)
+    # `npm run testcontainers:up` brings the stack up (or confirms an existing one) without running any tests
     ```
 
 ## Best Practices
 
 1. **Page Object Pattern**: Always use page/component objects from the library. No static UI selectors should be in test files.
 
-2. **Visual Testing**: For visual tests:
+2. **Locator Priority**: Follow the Playwright recommended locator strategy (see [Playwright Locators Quick Guide](https://playwright.dev/docs/locators#quick-guide)). Use locators in this priority order:
+    1. `getByRole()` - Preferred. Locates by accessibility role and accessible name (e.g., `getByRole('button', {name: 'Submit'})`).
+    2. `getByText()` - Locates by visible text content.
+    3. `getByLabel()` - Locates form controls by their associated label text.
+    4. `getByPlaceholder()` - Locates inputs by placeholder text.
+    5. `getByAltText()` - Locates elements (usually images) by alt text.
+    6. `getByTitle()` - Locates by the `title` attribute.
+    7. `getByTestId()` - Last resort. Locates by `data-testid` attribute.
+    - **Avoid** CSS selectors (`.class`, `#id`), XPath, and raw `locator()` calls unless none of the above locators can identify the element.
+    - Use `{exact: true}` when the accessible name might partially match other elements (e.g., `getByRole('button', {name: 'Invite', exact: true})`).
+
+3. **Visual Testing**: For visual tests:
     - Place all visual tests in the `specs/visual/` directory
     - Always include the `@visual` tag in the test tags array
     - Run via Docker container for consistency to maintain screenshot integrity
@@ -167,14 +186,14 @@ Before running tests, a Mattermost server must be available. Two options:
         - Tests should only be run inside the Playwright Docker container
     - Follow the visual test documentation format like other tests, with proper JSDoc and comments
 
-3. **Test Title Validation with Claude Code**: When using Claude:
+4. **Test Title Validation with Claude Code**: When using Claude:
     - Run `claude spec/path/to/file.spec.ts` to check your test file
     - Ask: "Check if test titles follow the format in CLAUDE.md"
     - Claude will analyze each test title and suggest improvements
     - Format should be action-oriented, feature-specific, context-aware, and outcome-focused
     - Example: `creates scheduled message from channel and posts at scheduled time`
 
-4. **Test Structure**:
+5. **Test Structure**:
     - Use descriptive test titles that follow this format:
         - **Action-oriented**: Start with a verb that describes the main action
         - **Feature-specific**: Include the feature or component being tested
@@ -194,7 +213,7 @@ Before running tests, a Mattermost server must be available. Two options:
     - Keep tests independent and isolated
     - Use tags to categorize tests with `{tag: '@feature_name'}`
 
-5. **Test Documentation Format**:
+6. **Test Documentation Format**:
     - Include JSDoc-style documentation before each test:
         ```typescript
         /**
@@ -231,12 +250,12 @@ Before running tests, a Mattermost server must be available. Two options:
         - `// # descriptive action` - Comments that describe steps being taken (e.g., `// # Initialize user and login`)
         - `// * descriptive verification` - Comments that describe assertions/checks (e.g., `// * Verify message appears in channel`)
 
-6. **Browser Compatibility**:
+7. **Browser Compatibility**:
     - Tests run on Chrome, Firefox, and iPad by default
     - Consider browser-specific behaviors for certain features
     - Use `test.skip()` for browser-specific limitations
 
-7. **Test Documentation Linting**:
+8. **Test Documentation Linting**:
     - Run `npm run lint:test-docs` to verify all spec files follow the documentation format
     - The linter checks for proper JSDoc tags, test titles, feature tags, and action/verification comments
     - This is also included in the standard `npm run check` command

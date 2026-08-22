@@ -392,10 +392,10 @@ func TestPluginSync(t *testing.T) {
 				cfg.FileSettings.AmazonS3AccessKeyId = model.NewPointer(model.MinioAccessKey)
 				cfg.FileSettings.AmazonS3SecretAccessKey = model.NewPointer(model.MinioSecretKey)
 				cfg.FileSettings.AmazonS3Bucket = model.NewPointer(model.MinioBucket)
-				cfg.FileSettings.AmazonS3PathPrefix = model.NewPointer("")
-				cfg.FileSettings.AmazonS3Endpoint = model.NewPointer(s3Endpoint)
-				cfg.FileSettings.AmazonS3Region = model.NewPointer("")
-				cfg.FileSettings.AmazonS3SSL = model.NewPointer(false)
+				cfg.FileSettings.AmazonS3PathPrefix = new("")
+				cfg.FileSettings.AmazonS3Endpoint = new(s3Endpoint)
+				cfg.FileSettings.AmazonS3Region = new("")
+				cfg.FileSettings.AmazonS3SSL = new(false)
 			},
 		},
 	}
@@ -648,7 +648,7 @@ func TestPluginPanicLogs(t *testing.T) {
 		th.App.ch.ShutDownPlugins()
 		tearDown()
 
-		testlib.AssertLog(t, th.LogBuffer, mlog.LvlDebug.Name, "panic: some text from panic")
+		testlib.AssertLog(t, th.LogBuffer, mlog.LvlError.Name, "panic: some text from panic")
 	})
 }
 
@@ -1266,6 +1266,11 @@ func TestGetPluginStateOverride(t *testing.T) {
 		})
 
 		t.Run("with enabled flag set to true", func(t *testing.T) {
+			// AppsEnabled=true is now rejected by Config.IsValid (MM-69643), so this
+			// override path can no longer be reached at runtime. Kept skipped rather
+			// than deleted so it is removed alongside the rest of the Apps code.
+			t.Skip("AppsEnabled feature flag is retired (MM-69643)")
+
 			mainHelper.Parallel(t)
 			th2 := SetupConfig(t, func(cfg *model.Config) {
 				cfg.FeatureFlags.AppsEnabled = true

@@ -23,7 +23,7 @@ import type {MMReduxAction} from 'mattermost-redux/action_types';
 import {ChannelTypes, PostTypes, UserTypes, ThreadTypes, CloudTypes, LimitsTypes, TeamTypes} from 'mattermost-redux/action_types';
 import {Posts} from 'mattermost-redux/constants';
 import {PostTypes as PostTypeConstants} from 'mattermost-redux/constants/posts';
-import {comparePosts, isPermalink, shouldUpdatePost} from 'mattermost-redux/utils/post_utils';
+import {comparePosts, isPermalink, isPostEphemeral, shouldUpdatePost} from 'mattermost-redux/utils/post_utils';
 
 export function removeUnneededMetadata(post: Post) {
     if (!post.metadata) {
@@ -432,6 +432,40 @@ export function handlePosts(state: IDMappedObjects<Post> = {}, action: MMReduxAc
         };
     }
 
+    case PostTypes.POST_TRANSLATION_UPDATED: {
+        const data: {
+            object_id: string;
+            language: string;
+            state: 'ready' | 'skipped' | 'processing' | 'unavailable';
+            translation?: string;
+            src_lang?: string;
+        } = action.data;
+        if (!state[data.object_id]) {
+            return state;
+        }
+
+        const existingTranslations = state[data.object_id].metadata?.translations || {};
+        const newTranslations = {
+            ...existingTranslations,
+            [data.language]: {
+                object: data.translation ? JSON.parse(data.translation) : undefined,
+                state: data.state,
+                source_lang: data.src_lang,
+            },
+        };
+
+        return {
+            ...state,
+            [data.object_id]: {
+                ...state[data.object_id],
+                metadata: {
+                    ...state[data.object_id].metadata,
+                    translations: newTranslations,
+                },
+            },
+        };
+    }
+
     case UserTypes.LOGOUT_SUCCESS:
         return {};
     default:
@@ -439,12 +473,35 @@ export function handlePosts(state: IDMappedObjects<Post> = {}, action: MMReduxAc
     }
 }
 
-function handlePostReceived(nextState: any, post: Post, nestedPermalinkLevel?: number) {
+// Integration action `update` payloads deserialize as a partial Post (often create_at=0).
+// Thread RHS order uses create_at via comparePosts; zero makes the ephemeral sort as oldest (above the root).
+// Ephemeral updates may omit user_id; keep the displayed author from the post already in state.
+function maintainEphemeralPostFields(incoming: Post, stored: Post): Post {
+    const out: Post = {...incoming};
+    if (!out.create_at && stored.create_at) {
+        out.create_at = stored.create_at;
+    }
+    if (!out.root_id && stored.root_id) {
+        out.root_id = stored.root_id;
+    }
+    if (!out.user_id && stored.user_id) {
+        out.user_id = stored.user_id;
+    }
+    return out;
+}
+
+function handlePostReceived(nextState: any, receivedPost: Post, nestedPermalinkLevel?: number) {
     let currentState = nextState;
 
     // Check if post already exists in state or if nested permalink
-    if (!shouldUpdatePost(post, currentState[post.id]) || (nestedPermalinkLevel && nestedPermalinkLevel > 1)) {
+    if (!shouldUpdatePost(receivedPost, currentState[receivedPost.id]) || (nestedPermalinkLevel && nestedPermalinkLevel > 1)) {
         return currentState;
+    }
+
+    const storedPost = currentState[receivedPost.id];
+    let post = receivedPost;
+    if (storedPost && isPostEphemeral(storedPost)) {
+        post = maintainEphemeralPostFields(receivedPost, storedPost);
     }
 
     // If post is a permalink and not nested (it links directly to the original message),
@@ -453,9 +510,19 @@ function handlePostReceived(nextState: any, post: Post, nestedPermalinkLevel?: n
         currentState[post.id] = {...currentState[post.id], ...post.metadata};
     }
 
-    // Edited posts that don't have 'is_following' specified should maintain 'is_following' state
-    if (post.update_at > 0 && post.is_following == null && currentState[post.id]) {
-        post.is_following = currentState[post.id].is_following;
+    // Posts that don't have CRT fields specified should maintain existing state.
+    // This happens when posts are returned via GetPostsByIds (e.g. translation
+    // supplement) which doesn't JOIN the Threads/ThreadMemberships tables.
+    if (post.update_at > 0 && currentState[post.id]) {
+        if (post.is_following == null) {
+            post.is_following = currentState[post.id].is_following;
+        }
+        if (post.participants == null && currentState[post.id].participants) {
+            post.participants = currentState[post.id].participants;
+        }
+        if (!post.last_reply_at && currentState[post.id].last_reply_at) {
+            post.last_reply_at = currentState[post.id].last_reply_at;
+        }
     }
 
     if (post.delete_at > 0) {
@@ -578,7 +645,13 @@ export function handlePendingPosts(state: string[] = [], action: MMReduxAction) 
 export function postsInChannel(state: Record<string, PostOrderBlock[]> = {}, action: MMReduxAction, prevPosts: IDMappedObjects<Post>, nextPosts: Record<string, Post>) {
     switch (action.type) {
     case PostTypes.RESET_POSTS_IN_CHANNEL: {
-        return {};
+        const {channelId} = action;
+        if (!channelId) {
+            return {};
+        }
+        const nextState = {...state};
+        Reflect.deleteProperty(nextState, channelId);
+        return nextState;
     }
     case PostTypes.RECEIVED_NEW_POST: {
         const post = action.data as Post;
@@ -939,9 +1012,7 @@ export function postsInChannel(state: Record<string, PostOrderBlock[]> = {}, act
 
             // For BoR posts: only remove the post itself (BoR doesn't support threads)
             // For regular posts: remove the post and its thread replies
-            const nextOrder = isBoRPost ?
-                block.order.filter((postId: string) => postId !== post.id) :
-                block.order.filter((postId: string) => postId !== post.id && prevPosts[postId]?.root_id !== post.id);
+            const nextOrder = isBoRPost ? block.order.filter((postId: string) => postId !== post.id) : block.order.filter((postId: string) => postId !== post.id && prevPosts[postId]?.root_id !== post.id);
 
             if (nextOrder.length !== block.order.length) {
                 nextPostsForChannel[i] = {
